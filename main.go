@@ -290,8 +290,8 @@ type ModelInfo struct {
 }
 
 var (
-	upstreamKeyCursorMu     sync.Mutex
-	upstreamKeyCursor = map[string]int{}
+	upstreamKeyCursorMu sync.Mutex
+	upstreamKeyCursor   = map[string]int{}
 )
 
 func splitUpstreamAPIKeys(raw string) []string {
@@ -472,7 +472,6 @@ func normalizeSingleUpstream(cfg *UpstreamConfig) bool {
 	return cfg.BaseURL != ""
 }
 
-
 func sortedUpstreamNames(m map[string]*UpstreamConfig) []string {
 	names := make([]string, 0, len(m))
 	for name := range m {
@@ -481,7 +480,6 @@ func sortedUpstreamNames(m map[string]*UpstreamConfig) []string {
 	sort.Strings(names)
 	return names
 }
-
 
 func getUpstreamModelsEndpoint(upstream *UpstreamConfig) string {
 	if upstream == nil || upstream.BaseURL == "" {
@@ -588,7 +586,6 @@ func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, err
 	}
 	return nil, lastErr
 }
-
 
 // emptyCustomModelUpstreams 返回 normalize 后 custom_models 仍为空的上游名（已按名排序）。
 // 仅统计 normalize 后保留下来的上游（有名字、有 BaseURL）；custom_models 是模型唯一来源，留空视为未配好。
@@ -870,10 +867,19 @@ type AppConfig struct {
 }
 
 type ModelAlias struct {
-	TargetModel   string `json:"target_model"`
-	Upstream      string `json:"upstream,omitempty"`
-	Socks5Proxy   string `json:"socks5_proxy,omitempty"`
-	WithReasoning bool   `json:"with_reasoning,omitempty"`
+	TargetModel string `json:"target_model"`
+	Upstream    string `json:"upstream,omitempty"`
+	Socks5Proxy string `json:"socks5_proxy,omitempty"`
+	// MultimodalModel 是可选的多模态模型：当请求本轮携带图片时，
+	// 路由切换到该模型（如 mimo）；纯文本仍走 TargetModel。
+	// 留空则不启用多模态路由（图片原样发给 TargetModel）。
+	MultimodalModel string `json:"multimodal_model,omitempty"`
+	// MultimodalUpstream 多模态模型可独立指定上游（与 TargetModel 不同上游）。
+	// 留空则复用 Upstream。
+	MultimodalUpstream string `json:"multimodal_upstream,omitempty"`
+	// MultimodalSocks5Proxy 多模态模型的独立代理出口。
+	// 留空则复用 Socks5Proxy。
+	MultimodalSocks5Proxy string `json:"multimodal_socks5_proxy,omitempty"`
 }
 
 // ======================== Anthropic Messages API 类型 ========================
@@ -999,6 +1005,9 @@ func normalizeConfig(cfg *AppConfig) {
 		alias.TargetModel = strings.TrimSpace(alias.TargetModel)
 		alias.Upstream = strings.TrimSpace(alias.Upstream)
 		alias.Socks5Proxy = strings.TrimSpace(alias.Socks5Proxy)
+		alias.MultimodalModel = strings.TrimSpace(alias.MultimodalModel)
+		alias.MultimodalUpstream = strings.TrimSpace(alias.MultimodalUpstream)
+		alias.MultimodalSocks5Proxy = strings.TrimSpace(alias.MultimodalSocks5Proxy)
 		if trimmedKey == "" {
 			delete(cfg.ModelAlias, key)
 			continue
@@ -1113,7 +1122,52 @@ func resolveModel(model string) (string, ModelAlias, string, *UpstreamConfig) {
 	return m, alias, upstreamName, upstream
 }
 
+// resolveEffectiveModel 根据是否多模态路由，返回最终使用的模型名、上游名、上游配置与代理 addr。
+// 多模态时若配置了独立的 multimodal_upstream / multimodal_socks5_proxy 则切换对应上游与代理；
+// 否则复用主上游与主代理。返回的 proxy 是代理 addr（若配置的是 name 则解析为 addr）。
+func resolveEffectiveModel(alias ModelAlias, baseModel string, baseUpstreamName string, baseUpstream *UpstreamConfig, useMultimodal bool) (string, string, *UpstreamConfig, string) {
+	if !useMultimodal {
+		return baseModel, baseUpstreamName, baseUpstream, alias.Socks5Proxy
+	}
+	mmModel := alias.MultimodalModel
+	if mmModel == "" {
+		return baseModel, baseUpstreamName, baseUpstream, alias.Socks5Proxy
+	}
+	mmUpstreamName := strings.TrimSpace(alias.MultimodalUpstream)
+	// 多模态代理：name → addr 解析；空则直连（不复用主代理），与 UI"直连"文案一致
+	mmProxy := resolveProxyAddr(alias.MultimodalSocks5Proxy)
+	if mmUpstreamName == "" {
+		// 复用主上游
+		return mmModel, baseUpstreamName, baseUpstream, mmProxy
+	}
+	// 切换到一个独立的多模态上游
+	upName, upCfg := resolveUpstream(mmUpstreamName)
+	if upCfg == nil {
+		// 多模态上游未配置，回退主上游
+		return mmModel, baseUpstreamName, baseUpstream, mmProxy
+	}
+	return mmModel, upName, upCfg, mmProxy
+}
 
+// resolveProxyAddr 将代理名（name）解析为 addr；若传入的已是 addr 则原样返回。
+// socks5 配置里 name 与 addr 都可能被引用，这里统一处理。
+func resolveProxyAddr(proxyRef string) string {
+	ref := strings.TrimSpace(proxyRef)
+	if ref == "" {
+		return ""
+	}
+	configMu.RLock()
+	defer configMu.RUnlock()
+	for _, p := range socks5Proxies {
+		if p.Addr == ref {
+			return p.Addr
+		}
+		if p.Name == ref {
+			return p.Addr
+		}
+	}
+	return ref
+}
 
 func getConfiguredUpstreamCount() int {
 	configMu.RLock()
@@ -2138,12 +2192,11 @@ func normalizeRawMessagesToolCallArguments(rawMessages any) error {
 	return nil
 }
 
-func ensureReasoningContent(messages []Message, withReasoning bool) []Message {
-	// Only inject empty reasoning_content when WithReasoning is enabled (DeepSeek upstream).
-	// Other upstreams don't need this and may reject the unknown field.
-	if !withReasoning {
-		return messages
-	}
+// ensureReasoningContent 为历史 assistant 消息补齐空的 reasoning_content 占位。
+// 对标 opencode2api：thinking 模式上游（DeepSeek）要求所有历史 assistant 消息
+// 必须回传 reasoning_content（可为空串），缺失会报 invalid_request_error。
+// 始终生效：对标 opencode2api，thinking 模式上游要求回传 reasoning_content。
+func ensureReasoningContent(messages []Message) []Message {
 	for i := range messages {
 		if messages[i].Role == "assistant" && messages[i].ReasoningContent == nil {
 			empty := ""
@@ -2153,7 +2206,7 @@ func ensureReasoningContent(messages []Message, withReasoning bool) []Message {
 	return messages
 }
 
-func convertMessagesForUpstream(messages []Message, withReasoning bool) []map[string]any {
+func convertMessagesForUpstream(messages []Message) []map[string]any {
 	converted := make([]map[string]any, 0, len(messages))
 	for _, msg := range messages {
 		clean := map[string]any{}
@@ -2200,10 +2253,35 @@ func convertMessagesForUpstream(messages []Message, withReasoning bool) []map[st
 				shouldSendContent = len(v) > 0
 			}
 		}
+		if content != nil {
+			// 兼容严格要求 content 全为 block 数组的上游（如 zen/serde）：
+			// ① 字符串 content → text block 数组（OpenAI 上游也接受，无副作用）
+			// ② content 数组内若有裸字符串元素（混合结构残留）→ 包成 text block
+			if msg.Role != "tool" {
+				if s, ok := content.(string); ok {
+					content = []any{map[string]any{"type": "text", "text": s}}
+				} else if arr, ok := content.([]any); ok {
+					for _, p := range arr {
+						if _, ok := p.(string); ok {
+							normalized := make([]any, 0, len(arr))
+							for _, item := range arr {
+								if s, ok := item.(string); ok {
+									normalized = append(normalized, map[string]any{"type": "text", "text": s})
+								} else {
+									normalized = append(normalized, item)
+								}
+							}
+							content = normalized
+							break
+						}
+					}
+				}
+			}
+		}
 		if shouldSendContent {
 			clean["content"] = content
 		}
-		if withReasoning && reasoningContent != nil && *reasoningContent != "" {
+		if reasoningContent != nil && *reasoningContent != "" {
 			clean["reasoning_content"] = *reasoningContent
 		}
 		if len(msg.ToolCalls) > 0 {
@@ -2222,10 +2300,10 @@ func convertMessagesForUpstream(messages []Message, withReasoning bool) []map[st
 
 // ======================== 完整请求转换（含 thinking/reasoning_effort/ExtraBody） ========================
 
-func convertRequest(req *OpenAIRequest, withReasoning bool) map[string]any {
+func convertRequest(req *OpenAIRequest) map[string]any {
 	converted := map[string]any{
 		"model":    req.Model,
-		"messages": convertMessagesForUpstream(req.Messages, withReasoning),
+		"messages": convertMessagesForUpstream(req.Messages),
 		"stream":   req.Stream,
 	}
 	if req.Temperature != nil {
@@ -2256,7 +2334,6 @@ func convertRequest(req *OpenAIRequest, withReasoning bool) map[string]any {
 	}
 
 	// thinking/reasoning_effort describe the current request and are independent
-	// from withReasoning, which only controls replaying historical reasoning_content.
 	if req.Thinking != nil {
 		converted["thinking"] = req.Thinking
 	} else if req.ExtraBody != nil {
@@ -2289,9 +2366,8 @@ func convertRequest(req *OpenAIRequest, withReasoning bool) map[string]any {
 	}
 	return converted
 }
-func buildUpstreamBody(req *OpenAIRequest, withReasoning ...bool) []byte {
-	wr := len(withReasoning) > 0 && withReasoning[0]
-	converted := convertRequest(req, wr)
+func buildUpstreamBody(req *OpenAIRequest) []byte {
+	converted := convertRequest(req)
 	b, err := json.Marshal(converted)
 	if err != nil {
 		log.Printf("Error marshaling upstream body: %v", err)
@@ -2848,23 +2924,24 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-			if shouldRetryUpstreamStatus(resp.StatusCode) {
-				log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
-				manyKeys := len(apiKeys) > 1
-				if manyKeys {
-					// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
-					apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
-				} else {
-					// 单 key：按指数退避，下一轮用更长的退避等待
-					if err := waitForRetry(ctx, retryDelay); err != nil {
-						return nil, 0, nil, err
-					}
+		if shouldRetryUpstreamStatus(resp.StatusCode) {
+			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			manyKeys := len(apiKeys) > 1
+			if manyKeys {
+				// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
+				apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
+			} else {
+				// 单 key：按指数退避，下一轮用更长的退避等待
+				if err := waitForRetry(ctx, retryDelay); err != nil {
+					return nil, 0, nil, err
 				}
-				// Refresh upstream config: user may have re-mapped or deleted this upstream
-				newUpstreamName, newUpstream := resolveUpstream(upstreamName)
-				if newUpstream == nil || newUpstream.BaseURL == "" {
-					log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
-					return errBody, resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)			}
+			}
+			// Refresh upstream config: user may have re-mapped or deleted this upstream
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return errBody, resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)
+			}
 			upstreamName, upstream = newUpstreamName, newUpstream
 			if manyKeys {
 				// 多 key：沿用 rotate 选定的 key，不重新按游标选（保留 429 切 key 的意图）
@@ -2958,23 +3035,24 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-			if shouldRetryUpstreamStatus(resp.StatusCode) {
-				log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
-				manyKeys := len(apiKeys) > 1
-				if manyKeys {
-					// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
-					apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
-				} else {
-					// 单 key：按指数退避，下一轮用更长的退避等待
-					if err := waitForRetry(ctx, retryDelay); err != nil {
-						return nil, 0, nil, err
-					}
+		if shouldRetryUpstreamStatus(resp.StatusCode) {
+			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			manyKeys := len(apiKeys) > 1
+			if manyKeys {
+				// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
+				apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
+			} else {
+				// 单 key：按指数退避，下一轮用更长的退避等待
+				if err := waitForRetry(ctx, retryDelay); err != nil {
+					return nil, 0, nil, err
 				}
-				// Refresh upstream config: user may have re-mapped or deleted this upstream
-				newUpstreamName, newUpstream := resolveUpstream(upstreamName)
-				if newUpstream == nil || newUpstream.BaseURL == "" {
-					log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
-					return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)			}
+			}
+			// Refresh upstream config: user may have re-mapped or deleted this upstream
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)
+			}
 			upstreamName, upstream = newUpstreamName, newUpstream
 			if manyKeys {
 				// 多 key：沿用 rotate 选定的 key，不重新按游标选（保留 429 切 key 的意图）
@@ -3575,7 +3653,22 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 多模态路由：检测到图片时转发到配置的上游
+	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
+	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
+	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
+	if modelAliasInfo.MultimodalModel != "" {
+		var useMM bool
+		if hasNewImageContent(req.Messages) {
+			useMM = true
+		} else {
+			req.Messages = stripImagesForTextModel(req.Messages)
+		}
+		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, req.Model, upstreamName, upstream, useMM)
+		req.Model = modelName
+		upstreamName = upName
+		upstream = up
+		modelAliasInfo.Socks5Proxy = proxy
+	}
 
 	req.Messages = fixToolCallGaps(req.Messages)
 	var toolArgsErr error
@@ -3586,8 +3679,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ensureReasoningEffort(&req, modelAliasInfo)
-	req.Messages = ensureReasoningContent(req.Messages, modelAliasInfo.WithReasoning)
-	upstreamBody := buildUpstreamBody(&req, modelAliasInfo.WithReasoning)
+	req.Messages = ensureReasoningContent(req.Messages)
+	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
 		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
@@ -4275,6 +4368,22 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	// 上游非 Anthropic 类型，走 Chat 中间格式转换
 
 	messages := anthropicToOpenAIMessages(anthropicReq.Messages, anthropicReq.System)
+	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
+	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
+	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
+	if modelAliasInfo.MultimodalModel != "" {
+		var useMM bool
+		if hasNewImageContent(messages) {
+			useMM = true
+		} else {
+			messages = stripImagesForTextModel(messages)
+		}
+		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, anthropicReq.Model, upstreamName, upstream, useMM)
+		anthropicReq.Model = modelName
+		upstreamName = upName
+		upstream = up
+		modelAliasInfo.Socks5Proxy = proxy
+	}
 	messages = fixToolCallGaps(messages)
 	var toolArgsErr error
 	messages, toolArgsErr = normalizeMessagesToolCallArguments(messages)
@@ -4311,9 +4420,8 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ensureReasoningEffort(&chatReq, modelAliasInfo)
-	chatReq.Messages = ensureReasoningContent(chatReq.Messages, modelAliasInfo.WithReasoning)
-
-	upstreamBody := buildUpstreamBody(&chatReq, modelAliasInfo.WithReasoning)
+	chatReq.Messages = ensureReasoningContent(chatReq.Messages)
+	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if anthropicReq.Stream {
 		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
@@ -5004,6 +5112,92 @@ func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 
 // ======================== Responses API ========================
 
+// contentHasImage 检查单个消息的 content 是否包含图片 part。
+// 兼容 OpenAI（image_url）、Responses（input_image）、Claude（image）三种类型。
+func contentHasImage(content any) bool {
+	arr, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range arr {
+		if block, ok := item.(map[string]any); ok {
+			switch block["type"] {
+			case "image_url", "input_image", "image":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasNewImageContent 只检测"本轮"是否新增了图片，用于多模态路由判定。
+// codex 每轮请求都携带完整历史，历史图片不应影响本轮路由。
+// 判定策略（已用 codex 真实请求结构验证）：
+//
+//	① 最后一个 user 消息自身 content 含图 → 本轮新增图片（最常见）
+//	② 最后一个 user 消息紧邻的前 1 条是 tool 输出且含图 → 本轮 view_image 场景
+//
+// 其余情况（包括历史图片）都不视为本轮新增，返回 false。
+func hasNewImageContent(messages []Message) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			if contentHasImage(messages[i].Content) {
+				return true
+			}
+			if i-1 >= 0 && messages[i-1].Role == "tool" &&
+				contentHasImage(messages[i-1].Content) {
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
+// stripImagesForTextModel 路由到纯文本模型（无多模态模型）时调用：
+// 把请求中所有图片 part 替换为文本占位，避免纯文本模型上游报错。
+// 因为 codex 每轮携带全量历史，历史图片也必须一并剥离。
+func stripImagesForTextModel(messages []Message) []Message {
+	for i := range messages {
+		parts, ok := messages[i].Content.([]any)
+		if !ok {
+			continue
+		}
+		changed := false
+		cleaned := make([]any, 0, len(parts))
+		for _, p := range parts {
+			block, ok := p.(map[string]any)
+			if !ok {
+				// 裸字符串元素：包成 text block（content 数组规范要求元素为对象，
+				// 混合数组 [字符串, 图片] 剥离后残留的裸字符串会导致上游报
+				// "invalid type: string, expected ...ContentBlock"）
+				if s, ok := p.(string); ok {
+					cleaned = append(cleaned, map[string]any{"type": "text", "text": s})
+					changed = true
+				} else {
+					cleaned = append(cleaned, p)
+				}
+				continue
+			}
+			switch block["type"] {
+			case "image_url", "input_image", "image":
+				// 图片 → 文本占位（文本模型不认图，但认得上下文说明）
+				cleaned = append(cleaned, map[string]any{
+					"type": "text",
+					"text": "[图片已省略]",
+				})
+				changed = true
+			default:
+				cleaned = append(cleaned, p)
+			}
+		}
+		if changed {
+			messages[i].Content = cleaned
+		}
+	}
+	return messages
+}
+
 func responsesInputToMessages(input any, instructions string) []Message {
 	var messages []Message
 	if instructions != "" {
@@ -5014,6 +5208,16 @@ func responsesInputToMessages(input any, instructions string) []Message {
 		messages = append(messages, Message{Role: "user", Content: v})
 	case []any:
 		var pendingAssistant *Message
+		// pendingOutputs 缓存当前 assistant turn 的工具输出（方案A：不立即 flush，
+		// 等同一 turn 的所有 function_call 聚合完成后统一输出，避免拆分出无
+		// reasoning_content 的 assistant 消息导致 DeepSeek thinking 模式拒绝）。
+		var pendingOutputs []struct {
+			CallID string
+			Output any
+		}
+		// pendingImages 暂存从 tool 输出提取的图片 part（mimo 等上游不接受
+		// tool 消息携带 image_url）。等下一个 user 消息时附加进去。
+		var pendingImages []map[string]any
 		ensurePendingAssistant := func() *Message {
 			if pendingAssistant == nil {
 				pendingAssistant = &Message{Role: "assistant", Content: ""}
@@ -5029,6 +5233,30 @@ func responsesInputToMessages(input any, instructions string) []Message {
 			}
 			messages = append(messages, *pendingAssistant)
 			pendingAssistant = nil
+			// assistant turn 聚合完成后，按序输出缓存的工具结果；
+			// 若 tool 输出含图片 part，提取到 pendingImages（tool 消息不能带图）。
+			for _, po := range pendingOutputs {
+				toolMsg := Message{Role: "tool", ToolCallID: po.CallID, Content: po.Output}
+				if parts, ok := po.Output.([]any); ok {
+					var kept []any
+					for _, p := range parts {
+						if block, ok := p.(map[string]any); ok {
+							if block["type"] == "image_url" {
+								pendingImages = append(pendingImages, block)
+								continue
+							}
+						}
+						kept = append(kept, p)
+					}
+					if len(kept) > 0 {
+						toolMsg.Content = kept
+					} else {
+						toolMsg.Content = "[tool output image]"
+					}
+				}
+				messages = append(messages, toolMsg)
+			}
+			pendingOutputs = nil
 		}
 		appendPendingReasoning := func(text string) {
 			if text == "" {
@@ -5058,7 +5286,17 @@ func responsesInputToMessages(input any, instructions string) []Message {
 			switch elem := item.(type) {
 			case string:
 				flushPendingAssistant()
-				messages = append(messages, Message{Role: "user", Content: elem})
+				// 若之前有 tool 输出的图片，附加到本 user 消息（图片作为普通 user 内容或跟随上下文）
+				if len(pendingImages) > 0 {
+					parts := []any{map[string]any{"type": "text", "text": elem}}
+					for _, img := range pendingImages {
+						parts = append(parts, img)
+					}
+					messages = append(messages, Message{Role: "user", Content: parts})
+					pendingImages = nil
+				} else {
+					messages = append(messages, Message{Role: "user", Content: elem})
+				}
 			case map[string]any:
 				itemType, _ := elem["type"].(string)
 				switch itemType {
@@ -5073,13 +5311,26 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						msg.ToolCalls = append(msg.ToolCalls, tc)
 					}
 				case "function_call_output", "tool_result":
-					flushPendingAssistant()
+					// 不立即 flush：同一 assistant turn 内可能有多个 function_call
+					// （codex 串行调工具时是 CO-CO 交替排布），立即 flush 会把它们
+					// 拆成多条 assistant 消息，导致后续消息丢失 reasoning_content
+					// （DeepSeek thinking 模式会拒绝）。先缓存输出，等当前 turn
+					// 聚合完成后再统一输出。
 					callID, output := responsesToolOutputFromItem(elem)
 					if callID != "" {
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
+						pendingOutputs = append(pendingOutputs, struct {
+							CallID string
+							Output any
+						}{callID, output})
 					}
 					continue
 				case "reasoning":
+					// 前一个 assistant turn 若还有未输出的 tool_calls（同一 turn
+					// 聚合中被新的 reasoning 打断），先 flush 它，避免新 reasoning
+					// 错误合并进旧 turn。连续 reasoning（无 tool_calls）时不 flush。
+					if pendingAssistant != nil && len(pendingAssistant.ToolCalls) > 0 {
+						flushPendingAssistant()
+					}
 					text := extractTextFromContentParts(elem["summary"])
 					if text == "" {
 						text = extractTextFromContentParts(elem["content"])
@@ -5108,6 +5359,15 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						content := responsesContentToChatContent(elem["content"])
 						if role == "system" {
 							content = extractTextFromContentParts(elem["content"])
+						}
+						// tool 输出的图片附加到 user 消息（mimo 等上游不接受 tool 消息带图）
+						if role == "user" && len(pendingImages) > 0 {
+							parts := []any{content}
+							for _, img := range pendingImages {
+								parts = append(parts, img)
+							}
+							content = parts
+							pendingImages = nil
 						}
 						messages = append(messages, Message{Role: role, Content: content})
 					}
@@ -5629,13 +5889,29 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 多模态路由
-
 	messages := respReq.Messages
 	if len(messages) == 0 {
 		messages = responsesInputToMessages(respReq.Input, respReq.Instructions)
 	} else if respReq.Instructions != "" {
 		messages = append([]Message{{Role: "system", Content: respReq.Instructions}}, messages...)
+	}
+
+	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
+	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
+	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
+	if modelAliasInfo.MultimodalModel != "" {
+		var useMM bool
+		if hasNewImageContent(messages) {
+			useMM = true
+		} else {
+			// 纯文本轮次：剥离历史图片，避免纯文本上游（如 deepseek）报错
+			messages = stripImagesForTextModel(messages)
+		}
+		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, respReq.Model, upstreamName, upstream, useMM)
+		respReq.Model = modelName
+		upstreamName = upName
+		upstream = up
+		modelAliasInfo.Socks5Proxy = proxy
 	}
 
 	chatReq := OpenAIRequest{
@@ -5663,7 +5939,6 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		chatReq.ExtraBody = map[string]any{"parallel_tool_calls": *respReq.ParallelToolCalls}
 	}
 	// reasoning.effort describes the current request and is independent from
-	// WithReasoning, which only controls replaying historical reasoning_content.
 	if respReq.Reasoning.Effort != "" {
 		if respReq.Reasoning.Effort != "none" {
 			chatReq.ReasoningEffort = respReq.Reasoning.Effort
@@ -5678,9 +5953,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ensureReasoningEffort(&chatReq, modelAliasInfo)
-	chatReq.Messages = ensureReasoningContent(chatReq.Messages, modelAliasInfo.WithReasoning)
-
-	upstreamBody := buildUpstreamBody(&chatReq, modelAliasInfo.WithReasoning)
+	chatReq.Messages = ensureReasoningContent(chatReq.Messages)
+	upstreamBody := buildUpstreamBody(&chatReq)
 
 	// callUpstream/callUpstreamStream 内部会根据当前请求选中的 upstream.APIType 自动转换请求格式
 	// 不需要在这里手动转换，避免双重转换导致请求体丢失
@@ -6314,6 +6588,17 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	if _, ok := usage["output_tokens"]; !ok {
 		usage["output_tokens"] = float64(0)
 	}
+	// 补齐必填嵌套字段（对标 opencode2api 的 normalizeUsageDetails）：
+	// codex 客户端反序列化 response.completed 时 input_tokens_details.cached_tokens
+	// 与 output_tokens_details.reasoning_tokens 均为必填，上游缺失会报
+	// "missing field cached_tokens/reasoning_tokens"。
+	if od, ok := usage["output_tokens_details"].(map[string]any); ok {
+		if _, ok := od["reasoning_tokens"]; !ok {
+			od["reasoning_tokens"] = float64(0)
+		}
+	} else if usage["output_tokens_details"] == nil {
+		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": 0}
+	}
 	completedResponse["usage"] = usage
 
 	if len(totalUsage) > 0 {
@@ -6479,6 +6764,15 @@ func convertChatToResponses(chatBody []byte, model string, tools []Tool, toolCho
 	if _, ok := usage["output_tokens"]; !ok {
 		usage["output_tokens"] = float64(0)
 	}
+	// 补齐必填嵌套字段（对标 opencode2api 的 normalizeUsageDetails）：
+	// output_tokens_details.reasoning_tokens 对 codex 客户端反序列化是必填。
+	if od, ok := usage["output_tokens_details"].(map[string]any); ok {
+		if _, ok := od["reasoning_tokens"]; !ok {
+			od["reasoning_tokens"] = float64(0)
+		}
+	} else if usage["output_tokens_details"] == nil {
+		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": 0}
+	}
 	responses["usage"] = usage
 
 	// 非流式 Responses API 直接返回 response 对象，不包成 SSE 事件外壳
@@ -6631,6 +6925,13 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+			// 多模态独立上游同样校验
+			if mmUpstream := strings.TrimSpace(alias.MultimodalUpstream); mmUpstream != "" {
+				if _, ok := cfg.Upstreams[mmUpstream]; !ok {
+					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的多模态上游 `+mmUpstream+` 不存在"}`, http.StatusBadRequest)
+					return
+				}
+			}
 		}
 		// 校验别名引用的 SOCKS5 代理是否存在（不再静默清空，避免用户不知情丢失配置）
 		proxyAddrSet := make(map[string]struct{}, len(cfg.Socks5Proxies))
@@ -6641,6 +6942,13 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			if aliasProxy := strings.TrimSpace(alias.Socks5Proxy); aliasProxy != "" {
 				if _, ok := proxyAddrSet[aliasProxy]; !ok {
 					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的代理 `+aliasProxy+` 不存在"}`, http.StatusBadRequest)
+					return
+				}
+			}
+			// 多模态独立代理同样校验
+			if mmProxy := strings.TrimSpace(alias.MultimodalSocks5Proxy); mmProxy != "" {
+				if _, ok := proxyAddrSet[mmProxy]; !ok {
+					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的多模态代理 `+mmProxy+` 不存在"}`, http.StatusBadRequest)
 					return
 				}
 			}
@@ -6991,7 +7299,7 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
-<thead><tr><th style="width:17%">别名（请求名）</th><th style="width:14%">上游</th><th style="width:24%">实际模型（上游名）</th><th style="width:18%">代理出口</th><th style="width:19%">回传 reasoning_content</th><th style="width:8%"></th></tr></thead>
+<thead><tr><th rowspan="2" style="width:13%">别名（客户端请求名）</th><th colspan="3">主路由</th><th rowspan="2" style="width:4%"></th></tr><tr><th colspan="3">多模态路由</th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
@@ -7038,7 +7346,7 @@ function customModelCount(value){return String(value||'').split(',').map(s=>s.tr
 function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','legacy','legacy_reasoning_effort'].includes(value);return '<select data-field="responses_reasoning_format"><option value=""'+(!legacy?' selected':'')+'>标准 reasoning.effort</option><option value="legacy_reasoning_effort"'+(legacy?' selected':'')+'>兼容 reasoning_effort</option></select>'}
 function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
 function buildModelListByUpstreamFromCustomModels(){const grouped={};Object.keys(upstreamData).forEach(name=>{const arr=(upstreamData[name]&&Array.isArray(upstreamData[name].custom_models))?upstreamData[name].custom_models:(typeof (upstreamData[name]||{}).custom_models==='string'?(upstreamData[name].custom_models.split(',').map(s=>s.trim()).filter(Boolean)):[]);grouped[name]=Array.from(new Set(arr)).sort()});return grouped}
-function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',with_reasoning:!!raw.with_reasoning}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',with_reasoning:false}}});aliasData=next}
+function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',multimodal_model:raw.multimodal_model||'',multimodal_upstream:raw.multimodal_upstream||'',multimodal_socks5_proxy:raw.multimodal_socks5_proxy||''}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',multimodal_model:'',multimodal_upstream:'',multimodal_socks5_proxy:''}}});aliasData=next}
 function normalizeUpstreamData(cfg){upstreamData=cfg.upstreams||{}}
 async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];normalizeUpstreamData(cfg);modelListByUpstream=buildModelListByUpstreamFromCustomModels()
 renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
@@ -7054,11 +7362,19 @@ function modelsForUpstream(name){const resolved=(name||'').trim();return modelLi
 function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="upstream" class="m-select" disabled><option value="">（未配置上游）</option></select>';let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)">';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
 function modelSelectHtml(selected,upstreamName){const models=modelsForUpstream(upstreamName);if(models.length===0)return '<select data-field="val" class="m-select" disabled><option value="">（未配置模型）</option></select>';let h='<select data-field="val" class="m-select">';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
 function socks5SelectHtml(selected){let h='<select data-field="socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
-function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="6" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',with_reasoning:false};const upName=entry.upstream||defaultUp;return '<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+upstreamSelectHtml(upName)+'</td><td data-model-cell="1">'+modelSelectHtml(entry.target_model||'',upName)+'</td><td>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"'+(entry.with_reasoning?' checked':'')+'></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>'}).join('')}
-function onAliasUpstreamChange(sel){const row=sel.closest('tr');const holder=row.querySelector('[data-model-cell]');const current=row.querySelector('[data-field="val"]');const currentVal=current?current.value.trim():'';holder.innerHTML=modelSelectHtml(currentVal,sel.value)}
-function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+upstreamSelectHtml(defaultUp)+'</td><td data-model-cell="1">'+modelSelectHtml('', defaultUp)+'</td><td>'+socks5SelectHtml('')+'</td><td><input type="checkbox" data-field="with_reasoning" title="将历史 assistant 消息中的 reasoning_content 回传给上游"></td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
-function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="6" class="empty-hint">暂无别名配置</td></tr>'}
-function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]'),w=tr.querySelector('[data-field="with_reasoning"]');if(k&&k.value.trim()){const aliasKey=k.value.trim();let targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const withReasoning=w?w.checked:false;if(!targetModel&&(upstreamName||socks5Proxy||withReasoning))targetModel=aliasKey;if(targetModel||upstreamName||socks5Proxy||withReasoning){r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,with_reasoning:withReasoning}}}});aliasData=r;return r}
+// 多模态模型的下拉：data-field 用 mm_val，模型从 data-mm-upstream 所选上游拉取
+function mmSelectHtml(selected,upstreamName){if(!upstreamName)return '<select data-field="mm_val" class="m-select" disabled><option value="">-- 选择模型 --</option></select>';const models=modelsForUpstream(upstreamName);let h='<select data-field="mm_val" class="m-select"><option value="">-- 选择模型 --</option>';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
+// 多模态上游下拉（data-field=mm_upstream），切换时刷新同行的 mm_val 模型列表
+function upstreamSelectHtmlMm(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="mm_upstream" class="m-select" disabled><option value="">-- 选择上游 --</option></select>';let h='<select data-field="mm_upstream" class="m-select" onchange="onMmUpstreamChange(this)"><option value="">-- 选择上游 --</option>';let found=!selected;for(const name of names){if(selected===name)found=true;h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
+// 多模态独立代理下拉
+function socks5SelectHtmlMm(selected){let h='<select data-field="mm_socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
+// 多模态上游变化时刷新多模态模型列表
+function onMmUpstreamChange(sel){const row=sel.closest('tr');const curVal=(row.querySelector('[data-field="mm_val"]')||{}).value?.trim()||'';const mmSel=row.querySelector('[data-field="mm_val"]');if(mmSel){const mmUp=sel.value;const newSel=document.createElement('span');newSel.innerHTML=mmSelectHtml(curVal,mmUp);const replaced=mmSel.closest('span');if(replaced){replaced.replaceWith(newSel.firstChild)}else{mmSel.outerHTML=newSel.innerHTML}}}
+function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const aliasUp=sortedUpstreams[0]||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',multimodal_model:'',multimodal_upstream:'',multimodal_socks5_proxy:''};const upName=entry.upstream||aliasUp;const mmUpName=entry.multimodal_upstream||upName;const mmUpSel=entry.multimodal_upstream||'';return '<tr><td rowspan="2"><input value="'+esc(k)+'" data-field="key"></td><td data-model-cell="1"><span style="font-size:10px;color:var(--text-ter)">主上游</span><br>'+upstreamSelectHtml(upName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主模型</span><br>'+modelSelectHtml(entry.target_model||'',upName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主代理出口</span><br>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td rowspan="2"><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr><tr><td data-mm-cell="1"><span style="font-size:10px;color:var(--text-ter)">多模态上游</span><br>'+upstreamSelectHtmlMm(mmUpSel)+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态模型</span><br>'+mmSelectHtml(entry.multimodal_model||'',mmUpName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态代理</span><br>'+socks5SelectHtmlMm(entry.multimodal_socks5_proxy||'')+'</td></tr>'}).join('')}
+function onAliasUpstreamChange(sel){const row=sel.closest('tr');const curVal=(row.querySelector('[data-field="val"]')||{}).value?.trim()||'';const vSel=row.querySelector('[data-field="val"]');if(vSel){const newSel=document.createElement('span');newSel.innerHTML=modelSelectHtml(curVal,sel.value);const replaced=vSel.closest('span');if(replaced){replaced.replaceWith(newSel.firstChild)}else{vSel.outerHTML=newSel.innerHTML}}}
+function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td rowspan="2"><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td data-model-cell="1"><span style="font-size:10px;color:var(--text-ter)">主上游</span><br>'+upstreamSelectHtml(defaultUp)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主模型</span><br>'+modelSelectHtml('', defaultUp)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主代理出口</span><br>'+socks5SelectHtml('')+'</td><td rowspan="2"><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr><tr><td data-mm-cell="1"><span style="font-size:10px;color:var(--text-ter)">多模态上游</span><br>'+upstreamSelectHtmlMm('')+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态模型</span><br>'+mmSelectHtml('','')+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态代理</span><br>'+socks5SelectHtmlMm('')+'</td></tr>')}
+function delAlias(btn){const row=btn.closest('tr');const mmRow=row.nextElementSibling;const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(mmRow&&mmRow.querySelector('[data-field="mm_val"]'))mmRow.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>'}
+function collectAliases(){const r={};const rows=document.querySelectorAll('#aliasTable tbody tr');for(let i=0;i<rows.length;i++){const tr=rows[i];const k=tr.querySelector('[data-field="key"]');if(!k||!k.value.trim())continue;const u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]');const mmRow=rows[i+1];const mm=mmRow?mmRow.querySelector('[data-field="mm_val"]'):null,mmup=mmRow?mmRow.querySelector('[data-field="mm_upstream"]'):null,mmsk=mmRow?mmRow.querySelector('[data-field="mm_socks_proxy"]'):null;if(!mmRow)continue;const aliasKey=k.value.trim();const targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const multimodalModel=mm?mm.value.trim():'';let mmUpstream=mmup?mmup.value.trim():'';const mmProxy=mmsk?mmsk.value.trim():'';if(targetModel||upstreamName||socks5Proxy||multimodalModel||mmUpstream||mmProxy)r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,multimodal_model:multimodalModel,multimodal_upstream:mmUpstream,multimodal_socks5_proxy:mmProxy};i++}aliasData=r;return r}
 
 
 
