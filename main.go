@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,13 +23,22 @@ import (
 	"time"
 )
 
-var httpClient = &http.Client{
-	Timeout: 300 * time.Second,
-	Transport: &http.Transport{
+func newBaseTransport() *http.Transport {
+	return &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
-	},
+	}
+}
+
+var httpClient = &http.Client{
+	Timeout:   600 * time.Second,
+	Transport: newBaseTransport(),
+}
+
+var streamHTTPClient = &http.Client{
+	Timeout:   0,
+	Transport: newBaseTransport(),
 }
 
 // ======================== SOCKS5 代理 ========================
@@ -39,325 +50,215 @@ type Socks5Proxy struct {
 	Name     string `json:"name,omitempty"`
 }
 
-func socks5Dial(proxy Socks5Proxy) func(ctx context.Context, network, addr string) (net.Conn, error) {
+// Billing header regex for stripping Anthropic system message headers
+var reBillingHeader = regexp.MustCompile(`(?m)^x-anthropic-billing-header:\s*.*$`)
+
+var (
+	socks5Proxies []Socks5Proxy
+	socks5Mu      sync.RWMutex
+)
+
+type socks5ClientKey struct {
+	Addr     string
+	Username string
+	Password string
+	Stream   bool
+}
+
+var (
+	socks5ClientsMu sync.Mutex
+	socks5Clients   = map[socks5ClientKey]*http.Client{}
+)
+
+func socks5Dial(proxy Socks5Proxy) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, target string) (net.Conn, error) {
-		conn, err := net.DialTimeout("tcp", proxy.Addr, 10*time.Second)
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err := dialer.DialContext(ctx, network, proxy.Addr)
 		if err != nil {
 			return nil, fmt.Errorf("socks5 connect to %s: %w", proxy.Addr, err)
 		}
+		fail := func(format string, args ...any) (net.Conn, error) {
+			conn.Close()
+			return nil, fmt.Errorf(format, args...)
+		}
+
 		deadline := time.Now().Add(15 * time.Second)
-		conn.SetDeadline(deadline)
+		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		if err := conn.SetDeadline(deadline); err != nil {
+			return fail("socks5 set deadline: %w", err)
+		}
 
-		// 认证方法协商
-		auth := byte(0x00) // no auth
+		authMethod := byte(0x00)
 		if proxy.Username != "" {
-			auth = 0x02 // username/password
+			authMethod = 0x02
 		}
-		if _, err := conn.Write([]byte{0x05, 0x01, auth}); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 handshake write: %w", err)
+		if _, err := conn.Write([]byte{0x05, 0x01, authMethod}); err != nil {
+			return fail("socks5 handshake write: %w", err)
 		}
-		buf := make([]byte, 2)
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 handshake read: %w", err)
+		handshake := make([]byte, 2)
+		if _, err := io.ReadFull(conn, handshake); err != nil {
+			return fail("socks5 handshake read: %w", err)
 		}
-		if buf[0] != 0x05 {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: not socks5 protocol")
+		if handshake[0] != 0x05 {
+			return fail("socks5: unexpected protocol version 0x%02x", handshake[0])
 		}
-
-		// 用户名/密码认证
-		if buf[1] == 0x02 {
+		switch handshake[1] {
+		case 0x00:
+		case 0x02:
 			if proxy.Username == "" {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: server requires auth but no credentials")
+				return fail("socks5: server requires authentication")
 			}
-			ulen := len(proxy.Username)
-			plen := len(proxy.Password)
-			authBuf := make([]byte, 3+ulen+plen)
-			authBuf[0] = 0x01
-			authBuf[1] = byte(ulen)
-			copy(authBuf[2:], proxy.Username)
-			authBuf[2+ulen] = byte(plen)
-			copy(authBuf[3+ulen:], proxy.Password)
-			if _, err := conn.Write(authBuf); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5 auth write: %w", err)
+			if len(proxy.Username) > 255 || len(proxy.Password) > 255 {
+				return fail("socks5: username or password is too long")
 			}
-			authResp := make([]byte, 2)
-			if _, err := io.ReadFull(conn, authResp); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5 auth read: %w", err)
+			auth := []byte{0x01, byte(len(proxy.Username))}
+			auth = append(auth, proxy.Username...)
+			auth = append(auth, byte(len(proxy.Password)))
+			auth = append(auth, proxy.Password...)
+			if _, err := conn.Write(auth); err != nil {
+				return fail("socks5 auth write: %w", err)
 			}
-			if authResp[1] != 0x00 {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: auth failed")
+			authResponse := make([]byte, 2)
+			if _, err := io.ReadFull(conn, authResponse); err != nil {
+				return fail("socks5 auth read: %w", err)
 			}
-		} else if buf[1] != 0x00 {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: unsupported auth method 0x%02x", buf[1])
-		}
-
-		// CONNECT 请求
-		host, portStr, err := net.SplitHostPort(target)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: invalid target %s: %w", target, err)
-		}
-		port := 0
-		fmt.Sscanf(portStr, "%d", &port)
-
-		req := []byte{0x05, 0x01, 0x00} // VER, CMD=CONNECT, RSV
-		ip := net.ParseIP(host)
-		if ip != nil {
-			if ip4 := ip.To4(); ip4 != nil {
-				req = append(req, 0x01) // IPv4
-				req = append(req, ip4...)
-			} else {
-				req = append(req, 0x04) // IPv6
-				req = append(req, ip.To16()...)
-			}
-		} else {
-			if len(host) > 255 {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: hostname too long")
-			}
-			req = append(req, 0x03) // Domain
-			req = append(req, byte(len(host)))
-			req = append(req, []byte(host)...)
-		}
-		req = append(req, byte(port>>8), byte(port))
-
-		if _, err := conn.Write(req); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 connect write: %w", err)
-		}
-
-		// 读取响应
-		resp := make([]byte, 4)
-		if _, err := io.ReadFull(conn, resp); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("socks5 connect read: %w", err)
-		}
-		if resp[1] != 0x00 {
-			conn.Close()
-			return nil, fmt.Errorf("socks5: connect failed, status 0x%02x", resp[1])
-		}
-
-		// 读取绑定地址
-		switch resp[3] {
-		case 0x01: // IPv4
-			if _, err := io.ReadFull(conn, make([]byte, 4+2)); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind ipv4: %w", err)
-			}
-		case 0x03: // Domain
-			dlen := make([]byte, 1)
-			if _, err := io.ReadFull(conn, dlen); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind domain len: %w", err)
-			}
-			if _, err := io.ReadFull(conn, make([]byte, int(dlen[0])+2)); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind domain: %w", err)
-			}
-		case 0x04: // IPv6
-			if _, err := io.ReadFull(conn, make([]byte, 16+2)); err != nil {
-				conn.Close()
-				return nil, fmt.Errorf("socks5: read bind ipv6: %w", err)
+			if authResponse[1] != 0x00 {
+				return fail("socks5: authentication failed")
 			}
 		default:
-			conn.Close()
-			return nil, fmt.Errorf("socks5: unknown address type 0x%02x", resp[3])
+			return fail("socks5: unsupported authentication method 0x%02x", handshake[1])
 		}
 
-		conn.SetDeadline(time.Time{})
+		host, portText, err := net.SplitHostPort(target)
+		if err != nil {
+			return fail("socks5: invalid target %s: %w", target, err)
+		}
+		portNumber, err := strconv.Atoi(portText)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return fail("socks5: invalid target port %q", portText)
+		}
+		request := []byte{0x05, 0x01, 0x00}
+		if ip := net.ParseIP(host); ip != nil {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				request = append(request, 0x01)
+				request = append(request, ipv4...)
+			} else {
+				request = append(request, 0x04)
+				request = append(request, ip.To16()...)
+			}
+		} else {
+			if len(host) == 0 || len(host) > 255 {
+				return fail("socks5: invalid target hostname")
+			}
+			request = append(request, 0x03, byte(len(host)))
+			request = append(request, host...)
+		}
+		request = append(request, byte(portNumber>>8), byte(portNumber))
+		if _, err := conn.Write(request); err != nil {
+			return fail("socks5 connect write: %w", err)
+		}
+
+		response := make([]byte, 4)
+		if _, err := io.ReadFull(conn, response); err != nil {
+			return fail("socks5 connect read: %w", err)
+		}
+		if response[0] != 0x05 || response[1] != 0x00 {
+			return fail("socks5: connect failed, status 0x%02x", response[1])
+		}
+		addressLength := 0
+		switch response[3] {
+		case 0x01:
+			addressLength = 4
+		case 0x03:
+			length := make([]byte, 1)
+			if _, err := io.ReadFull(conn, length); err != nil {
+				return fail("socks5: read bind hostname length: %w", err)
+			}
+			addressLength = int(length[0])
+		case 0x04:
+			addressLength = 16
+		default:
+			return fail("socks5: unknown bind address type 0x%02x", response[3])
+		}
+		if _, err := io.ReadFull(conn, make([]byte, addressLength+2)); err != nil {
+			return fail("socks5: read bind address: %w", err)
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return fail("socks5 clear deadline: %w", err)
+		}
 		return conn, nil
 	}
 }
 
-var (
-	socks5Proxies []Socks5Proxy
-	activeSocks5  string // 启用的代理 Addr；空表示直连；特殊值表示轮询/429 切换
-	socks5Mu      sync.RWMutex
-)
-
-const (
-	socks5RR                      = "__round_robin__"
-	socks5RateLimitSwitch         = "__rate_limit_switch__"
-	socks5RateLimitSwitchNoDirect = "__rate_limit_switch_no_direct__"
-)
-
-var (
-	socks5RRIndex        uint32
-	socks5RateLimitIndex uint32 // 0 表示直连，1..n 表示 socks5Proxies[n-1]
-)
-
-var (
-	socks5Client     *http.Client // 缓存的 SOCKS5 客户端
-	socks5ClientAddr string       // 缓存对应的代理地址
-)
-
-func getHTTPClient() *http.Client {
-	socks5Mu.Lock()
-	defer socks5Mu.Unlock()
-
-	if activeSocks5 == "" {
-		return httpClient
-	}
-
-	var proxy Socks5Proxy
-	var useRR bool
-	selectedAddr := activeSocks5
-
-	if activeSocks5 == socks5RR {
-		if len(socks5Proxies) == 0 {
-			return httpClient
-		}
-		idx := atomic.AddUint32(&socks5RRIndex, 1) % uint32(len(socks5Proxies))
-		proxy = socks5Proxies[idx]
-		useRR = true
-		selectedAddr = proxy.Addr
-	} else if activeSocks5 == socks5RateLimitSwitch || activeSocks5 == socks5RateLimitSwitchNoDirect {
-		var ok bool
-		proxy, ok = currentRateLimitProxyLocked(activeSocks5 == socks5RateLimitSwitch)
-		if !ok {
-			return httpClient
-		}
-		selectedAddr = proxy.Addr
-	} else {
-		if socks5Client != nil && socks5ClientAddr == selectedAddr {
-			return socks5Client
-		}
-
-		var found bool
-		for i := range socks5Proxies {
-			if socks5Proxies[i].Addr == activeSocks5 {
-				proxy = socks5Proxies[i]
-				found = true
-				break
-			}
-		}
-		if !found {
-			return httpClient
-		}
-	}
-
-	if !useRR && socks5Client != nil && socks5ClientAddr == selectedAddr {
-		return socks5Client
-	}
-
-	dial := socks5Dial(proxy)
-	client := &http.Client{
-		Timeout: 300 * time.Second,
-		Transport: &http.Transport{
-			DialContext:         dial,
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 20,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
-
-	if !useRR {
-		socks5Client = client
-		socks5ClientAddr = selectedAddr
-	}
-	return client
-}
-
-func currentRateLimitProxyLocked(includeDirect bool) (Socks5Proxy, bool) {
-	total := len(socks5Proxies)
-	if includeDirect {
-		total++
-	}
-	if total <= 0 {
+func configuredSocks5Proxy(addr string) (Socks5Proxy, bool) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
 		return Socks5Proxy{}, false
 	}
-	idx := int(atomic.LoadUint32(&socks5RateLimitIndex)) % total
-	if includeDirect && idx == 0 {
-		return Socks5Proxy{}, false
+	socks5Mu.RLock()
+	defer socks5Mu.RUnlock()
+	for _, proxy := range socks5Proxies {
+		if proxy.Addr == addr {
+			return proxy, true
+		}
 	}
-	if includeDirect {
-		return socks5Proxies[idx-1], true
-	}
-	return socks5Proxies[idx], true
+	return Socks5Proxy{}, false
 }
 
-func socks5ExitLabelLocked(idx int, includeDirect bool) string {
-	if includeDirect && idx <= 0 {
-		return "direct"
-	}
-	proxyIdx := idx
-	if includeDirect {
-		proxyIdx = idx - 1
-	}
-	if proxyIdx < 0 || proxyIdx >= len(socks5Proxies) {
-		return "direct"
-	}
-	proxy := socks5Proxies[proxyIdx]
+func socks5ProxyLabel(proxy Socks5Proxy) string {
 	if proxy.Name != "" {
 		return proxy.Name + " (" + proxy.Addr + ")"
 	}
 	return proxy.Addr
 }
 
-func currentSocks5ExitLabel() string {
-	socks5Mu.RLock()
-	defer socks5Mu.RUnlock()
-	includeDirect := activeSocks5 == socks5RateLimitSwitch
-	total := len(socks5Proxies)
-	if includeDirect {
-		total++
+func getModelHTTPClient(proxyAddr string, stream bool) (*http.Client, string) {
+	proxy, ok := configuredSocks5Proxy(proxyAddr)
+	if !ok {
+		if stream {
+			return streamHTTPClient, "direct"
+		}
+		return httpClient, "direct"
 	}
-	if total <= 0 {
-		return "direct"
+	key := socks5ClientKey{
+		Addr:     proxy.Addr,
+		Username: proxy.Username,
+		Password: proxy.Password,
+		Stream:   stream,
 	}
-	idx := int(atomic.LoadUint32(&socks5RateLimitIndex)) % total
-	return socks5ExitLabelLocked(idx, includeDirect)
+	socks5ClientsMu.Lock()
+	defer socks5ClientsMu.Unlock()
+	if client := socks5Clients[key]; client != nil {
+		return client, socks5ProxyLabel(proxy)
+	}
+	transport := newBaseTransport()
+	transport.DialContext = socks5Dial(proxy)
+	client := &http.Client{Transport: transport, Timeout: 600 * time.Second}
+	if stream {
+		client.Timeout = 0
+	}
+	socks5Clients[key] = client
+	return client, socks5ProxyLabel(proxy)
 }
 
-func socks5RateLimitAttemptCount() int {
-	socks5Mu.RLock()
-	defer socks5Mu.RUnlock()
-	switch activeSocks5 {
-	case socks5RateLimitSwitch:
-		return len(socks5Proxies) + 1
-	case socks5RateLimitSwitchNoDirect:
-		if len(socks5Proxies) == 0 {
-			return 1
-		}
-		return len(socks5Proxies)
-	default:
-		return 1
+func modelProxyLabel(proxyAddr string) string {
+	if proxy, ok := configuredSocks5Proxy(proxyAddr); ok {
+		return socks5ProxyLabel(proxy)
 	}
+	return "direct"
 }
 
-func rotateSocks5OnRateLimit() {
-	socks5Mu.Lock()
-	defer socks5Mu.Unlock()
-	includeDirect := activeSocks5 == socks5RateLimitSwitch
-	if activeSocks5 != socks5RateLimitSwitch && activeSocks5 != socks5RateLimitSwitchNoDirect {
-		return
-	}
-	total := len(socks5Proxies)
-	if includeDirect {
-		total++
-	}
-	if total <= 1 {
-		if includeDirect {
-			log.Printf("[rate-limit proxy switch] upstream 429, only direct exit available")
-		} else {
-			log.Printf("[rate-limit proxy switch] upstream 429, no SOCKS5 exit available")
+func clearSocks5ClientCache() {
+	socks5ClientsMu.Lock()
+	defer socks5ClientsMu.Unlock()
+	for _, client := range socks5Clients {
+		if transport, ok := client.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
 		}
-		return
 	}
-	oldIdx := int(atomic.LoadUint32(&socks5RateLimitIndex)) % total
-	nextIdx := (oldIdx + 1) % total
-	atomic.StoreUint32(&socks5RateLimitIndex, uint32(nextIdx))
-	socks5Client = nil
-	socks5ClientAddr = ""
-	log.Printf("[rate-limit proxy switch] upstream 429: %s -> %s", socks5ExitLabelLocked(oldIdx, includeDirect), socks5ExitLabelLocked(nextIdx, includeDirect))
+	socks5Clients = map[socks5ClientKey]*http.Client{}
 }
 
 // ======================== 随机 ID ========================
@@ -372,63 +273,12 @@ func randomString(n int) string {
 	return string(b)
 }
 
-func randomHex(n int) string {
-	const hex = "0123456789abcdef"
-	b := make([]byte, n)
-	rand.Read(b)
-	for i := range b {
-		b[i] = hex[b[i]%byte(len(hex))]
-	}
-	return string(b)
-}
-
 // ======================== OpenCode 会话 ========================
 
 var (
-	ocSessionID  string
-	ocProjectID  string
-	ocClientVer  string
-	ocOnce       sync.Once
+	upstreamCfgs = map[string]*UpstreamConfig{}
 	requestCount atomic.Int64
 )
-
-func fetchOCVersion() string {
-	req, _ := http.NewRequest("GET", "https://registry.npmjs.org/opencode-ai/latest", nil)
-	req.Header.Set("Accept", "application/json")
-	resp, err := getHTTPClient().Do(req)
-	if err != nil {
-		return "1.15.3"
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var info struct {
-		Version string `json:"version"`
-	}
-	if json.Unmarshal(body, &info) == nil && info.Version != "" {
-		return info.Version
-	}
-	return "1.15.3"
-}
-
-func initOCSession() {
-	ocOnce.Do(func() {
-		ocClientVer = fetchOCVersion()
-		ocSessionID = "ses_" + randomString(24)
-		ocProjectID = randomHex(40)
-		log.Printf("OpenCode Version: %s", ocClientVer)
-		log.Printf("Session: %s", ocSessionID)
-		log.Printf("Project: %s", ocProjectID)
-	})
-}
-
-func refreshOCSession() {
-	ocClientVer = fetchOCVersion()
-	ocSessionID = "ses_" + randomString(24)
-	ocProjectID = randomHex(40)
-	log.Printf("会话已刷新: version=%s session=%s", ocClientVer, ocSessionID)
-	// 重置 Once 以便后续 initOCSession 调用直接通过
-	ocOnce = sync.Once{}
-}
 
 // ======================== 模型 ========================
 
@@ -440,58 +290,397 @@ type ModelInfo struct {
 }
 
 var (
-	modelsCache  []ModelInfo
-	modelMu      sync.RWMutex
-	modelsLoaded bool
+	upstreamKeyCursorMu sync.Mutex
+	upstreamKeyCursor   = map[string]int{}
 )
 
-func fetchModels() ([]ModelInfo, error) {
-	req, _ := http.NewRequest("GET", "https://opencode.ai/zen/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("x-opencode-session", ocSessionID)
-	resp, err := getHTTPClient().Do(req)
-	if err != nil {
-		return nil, err
+func splitUpstreamAPIKeys(raw string) []string {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	raw = strings.ReplaceAll(raw, "\r", "\n")
+	if strings.TrimSpace(raw) == "" {
+		return nil
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+	seen := map[string]struct{}{}
+	keys := make([]string, 0, strings.Count(raw, "\n")+1)
+	for _, line := range strings.Split(raw, "\n") {
+		key := strings.TrimSpace(line)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-	var models []ModelInfo
-	now := time.Now().Unix()
-	for _, m := range result.Data {
-		models = append(models, ModelInfo{ID: m.ID, Object: "model", Created: now, OwnedBy: "opencode"})
-	}
-	return models, nil
+	return keys
 }
 
-func getModelIDs() []string {
-	modelMu.RLock()
-	defer modelMu.RUnlock()
-	ids := make([]string, len(modelsCache))
-	for i, m := range modelsCache {
-		ids[i] = m.ID
+func getUpstreamAPIKeys(upstream *UpstreamConfig) []string {
+	if upstream == nil {
+		return nil
 	}
-	return ids
+	return splitUpstreamAPIKeys(upstream.APIKey)
+}
+
+func nextUpstreamAPIKeyIndex(name string, total int) int {
+	if total <= 1 {
+		return 0
+	}
+	resolvedName := effectiveUpstreamName(name)
+	upstreamKeyCursorMu.Lock()
+	defer upstreamKeyCursorMu.Unlock()
+	idx := upstreamKeyCursor[resolvedName] % total
+	upstreamKeyCursor[resolvedName] = (idx + 1) % total
+	return idx
+}
+
+func selectUpstreamAPIKey(name string, upstream *UpstreamConfig) (string, int, []string) {
+	keys := getUpstreamAPIKeys(upstream)
+	if len(keys) == 0 {
+		return "", -1, nil
+	}
+	idx := nextUpstreamAPIKeyIndex(name, len(keys))
+	return keys[idx], idx, keys
+}
+
+func rotateUpstreamAPIKey(keys []string, current int) (string, int) {
+	if len(keys) == 0 {
+		return "", -1
+	}
+	if current < 0 {
+		current = 0
+	}
+	next := (current + 1) % len(keys)
+	return keys[next], next
+}
+
+func formatUpstreamAPIKeySlot(index int, total int) string {
+	if index < 0 || total <= 0 {
+		return "0/0"
+	}
+	return fmt.Sprintf("%d/%d", index+1, total)
+}
+
+func waitForRetry(ctx context.Context, baseDelay time.Duration) error {
+	delay := baseDelay
+	if delay <= 0 {
+		delay = time.Second
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func nextRetryDelay(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return time.Second
+	}
+	if delay >= 30*time.Second {
+		return 30 * time.Second
+	}
+	delay *= 2
+	if delay > 30*time.Second {
+		return 30 * time.Second
+	}
+	return delay
+}
+
+func shouldRetryUpstreamStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusInternalServerError:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneUpstreamConfig(cfg *UpstreamConfig) *UpstreamConfig {
+	if cfg == nil {
+		return nil
+	}
+	cp := *cfg
+	if cfg.CustomModels != nil {
+		cp.CustomModels = append([]string(nil), cfg.CustomModels...)
+	}
+	return &cp
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameUpstreamConfig(a, b *UpstreamConfig) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.BaseURL == b.BaseURL &&
+		a.APIKey == b.APIKey &&
+		a.APIType == b.APIType &&
+		a.ResponsesReasoningFormat == b.ResponsesReasoningFormat &&
+		sameStringSlice(a.CustomModels, b.CustomModels)
+}
+
+// upstreamsConfigChanged 判断上游连接相关配置是否变化（模型列表依赖这些字段）。
+// 别名、推理映射、代理等不影响上游模型列表。
+func upstreamsConfigChanged(oldMap map[string]*UpstreamConfig, newMap map[string]*UpstreamConfig) bool {
+	if len(oldMap) != len(newMap) {
+		return true
+	}
+	for name, newCfg := range newMap {
+		oldCfg, ok := oldMap[name]
+		if !ok || !sameUpstreamConfig(oldCfg, newCfg) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSingleUpstream(cfg *UpstreamConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	cfg.BaseURL = strings.TrimSpace(cfg.BaseURL)
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	if cfg.APIType == "" {
+		cfg.APIType = UpstreamOpenAI
+	}
+	cfg.ResponsesReasoningFormat = strings.TrimSpace(cfg.ResponsesReasoningFormat)
+	if len(cfg.CustomModels) > 0 {
+		cleaned := make([]string, 0, len(cfg.CustomModels))
+		for _, model := range cfg.CustomModels {
+			model = strings.TrimSpace(model)
+			if model != "" {
+				cleaned = append(cleaned, model)
+			}
+		}
+		cfg.CustomModels = cleaned
+	}
+	return cfg.BaseURL != ""
+}
+
+func sortedUpstreamNames(m map[string]*UpstreamConfig) []string {
+	names := make([]string, 0, len(m))
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func getUpstreamModelsEndpoint(upstream *UpstreamConfig) string {
+	if upstream == nil || upstream.BaseURL == "" {
+		return ""
+	}
+	base := strings.TrimRight(upstream.BaseURL, "/")
+	return base + "/models"
+}
+
+// ttfbReadCloser wraps an io.ReadCloser and logs the time-to-first-byte
+// on the first Read call, then delegates all subsequent calls to the inner ReadCloser.
+type ttfbReadCloser struct {
+	inner      io.ReadCloser
+	once       sync.Once
+	start      time.Time
+	upstream   string
+	model      string
+	clientAPI  string
+	keySlot    string
+	proxyLabel string
+}
+
+func (r *ttfbReadCloser) Read(p []byte) (int, error) {
+	n, err := r.inner.Read(p)
+	r.once.Do(func() {
+		ttfb := time.Since(r.start)
+		log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", r.clientAPI, r.upstream, r.model, r.keySlot, r.proxyLabel, ttfb.Round(time.Millisecond))
+	})
+	return n, err
+}
+
+func (r *ttfbReadCloser) Close() error {
+	return r.inner.Close()
+}
+
+func fetchModelsFromUpstream(name string, cfg *UpstreamConfig) ([]ModelInfo, error) {
+	if cfg == nil || cfg.BaseURL == "" {
+		return []ModelInfo{}, nil
+	}
+	ownedBy := effectiveUpstreamName(name)
+	if len(cfg.CustomModels) > 0 {
+		var models []ModelInfo
+		now := time.Now().Unix()
+		for _, m := range cfg.CustomModels {
+			models = append(models, ModelInfo{ID: m, Object: "model", Created: now, OwnedBy: ownedBy})
+		}
+		return models, nil
+	}
+	endpoint := getUpstreamModelsEndpoint(cfg)
+	apiKeys := getUpstreamAPIKeys(cfg)
+	if len(apiKeys) == 0 {
+		apiKeys = []string{""}
+	}
+	start := nextUpstreamAPIKeyIndex(name, len(apiKeys))
+	var lastErr error
+	for i := 0; i < len(apiKeys); i++ {
+		apiKeyIndex := (start + i) % len(apiKeys)
+		apiKey := apiKeys[apiKeyIndex]
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		if apiKey != "" {
+			if cfg.APIType == UpstreamAnthropic {
+				req.Header.Set("x-api-key", apiKey)
+				req.Header.Set("anthropic-version", "2023-06-01")
+				req.Header.Set("anthropic-beta", "prompt-caching-2025-01-31")
+			} else {
+				req.Header.Set("Authorization", "Bearer "+apiKey)
+			}
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			var result struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(body, &result); err != nil {
+				return nil, err
+			}
+			var models []ModelInfo
+			now := time.Now().Unix()
+			for _, m := range result.Data {
+				models = append(models, ModelInfo{ID: m.ID, Object: "model", Created: now, OwnedBy: ownedBy})
+			}
+			return models, nil
+		}
+		if shouldRetryUpstreamStatus(resp.StatusCode) && len(apiKeys) > 1 {
+			lastErr = fmt.Errorf("models endpoint retryable status %d on key %s", resp.StatusCode, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)))
+			continue
+		}
+		lastErr = fmt.Errorf("models endpoint status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		break
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("models endpoint request failed")
+	}
+	return nil, lastErr
+}
+
+// emptyCustomModelUpstreams 返回 normalize 后 custom_models 仍为空的上游名（已按名排序）。
+// 仅统计 normalize 后保留下来的上游（有名字、有 BaseURL）；custom_models 是模型唯一来源，留空视为未配好。
+func emptyCustomModelUpstreams(m map[string]*UpstreamConfig) []string {
+	var empty []string
+	for _, name := range sortedUpstreamNames(m) {
+		if cfg := m[name]; cfg != nil && cfg.BaseURL != "" && len(cfg.CustomModels) == 0 {
+			empty = append(empty, name)
+		}
+	}
+	return empty
+}
+
+func effectiveUpstreamName(name string) string {
+	if strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name)
+	}
+	return "default"
+}
+
+func getConfiguredUpstreams() map[string]*UpstreamConfig {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	upstreams := make(map[string]*UpstreamConfig, len(upstreamCfgs))
+	for name, cfg := range upstreamCfgs {
+		upstreams[name] = cloneUpstreamConfig(cfg)
+	}
+	return upstreams
+}
+
+func resolveUpstream(name string) (string, *UpstreamConfig) {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	resolvedName := strings.TrimSpace(name)
+	if resolvedName == "" {
+		return "", nil
+	}
+	if cfg := cloneUpstreamConfig(upstreamCfgs[resolvedName]); cfg != nil {
+		return resolvedName, cfg
+	}
+	return resolvedName, nil
+}
+
+func countConfiguredModels() int {
+	upstreams := getConfiguredUpstreams()
+	seen := map[string]struct{}{}
+	for _, cfg := range upstreams {
+		for _, m := range cfg.CustomModels {
+			trimmed := strings.TrimSpace(m)
+			if trimmed == "" {
+				continue
+			}
+			seen[trimmed] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+func getAliasModelInfos() []ModelInfo {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if len(modelAlias) == 0 {
+		return []ModelInfo{}
+	}
+	names := make([]string, 0, len(modelAlias))
+	for name := range modelAlias {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	now := time.Now().Unix()
+	models := make([]ModelInfo, 0, len(names))
+	for _, name := range names {
+		models = append(models, ModelInfo{
+			ID:      name,
+			Object:  "model",
+			Created: now,
+			OwnedBy: "alias",
+		})
+	}
+	return models
 }
 
 // ======================== 配置 ========================
 
 var (
-	port                 string
-	configPath           = "config.json"
-	modelAlias           = map[string]string{}
+	port       string
+	configPath = "config.json"
+	modelAlias = map[string]ModelAlias{}
 
-	reasoningEffortMap   = map[string]string{}
-	forceDisableThinking bool
-	debugMode            bool
-	configMu             sync.RWMutex
+	reasoningEffortMap = map[string]string{}
+	debugMode          bool
+	configMu           sync.RWMutex
 )
 
 // ======================== 管理面板认证 ========================
@@ -617,6 +806,7 @@ type OpenAIRequest struct {
 	Thinking        any            `json:"thinking,omitempty"`
 	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
 	ExtraBody       map[string]any `json:"extra_body,omitempty"`
+	StreamOptions   any            `json:"stream_options,omitempty"`
 	Tools           []Tool         `json:"tools,omitempty"`
 	ToolChoice      any            `json:"tool_choice,omitempty"`
 }
@@ -652,37 +842,68 @@ type ToolFunction struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
+type UpstreamType string
+
+const (
+	UpstreamOpenAI    UpstreamType = "openai"
+	UpstreamAnthropic UpstreamType = "anthropic"
+	UpstreamResponses UpstreamType = "openai-responses"
+)
+
+type UpstreamConfig struct {
+	BaseURL                  string       `json:"base_url"`
+	APIKey                   string       `json:"api_key"`
+	APIType                  UpstreamType `json:"api_type"`
+	CustomModels             []string     `json:"custom_models,omitempty"`
+	ResponsesReasoningFormat string       `json:"responses_reasoning_format,omitempty"`
+}
+
 type AppConfig struct {
-	ModelAlias           map[string]string `json:"model_alias"`
+	ModelAlias map[string]ModelAlias `json:"model_alias"`
 
-	ReasoningEffortMap   map[string]string `json:"reasoning_effort_map"`
-	ForceDisableThinking bool              `json:"force_disable_thinking"`
-	Socks5Proxies        []Socks5Proxy     `json:"socks5_proxies,omitempty"`
-	ActiveSocks5         string            `json:"active_socks5,omitempty"`
+	ReasoningEffortMap map[string]string          `json:"reasoning_effort_map"`
+	Socks5Proxies      []Socks5Proxy              `json:"socks5_proxies,omitempty"`
+	Upstreams          map[string]*UpstreamConfig `json:"upstreams,omitempty"`
 }
 
-// ======================== Claude Messages API 类型 ========================
-
-type ClaudeRequest struct {
-	Model       string          `json:"model"`
-	Messages    []ClaudeMessage `json:"messages"`
-	System      any             `json:"system,omitempty"`
-	MaxTokens   int             `json:"max_tokens,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
-	Tools       []ClaudeTool    `json:"tools,omitempty"`
-	ToolChoice  any             `json:"tool_choice,omitempty"`
-	Metadata    any             `json:"metadata,omitempty"`
-	Thinking    any             `json:"thinking,omitempty"`
+type ModelAlias struct {
+	TargetModel string `json:"target_model"`
+	Upstream    string `json:"upstream,omitempty"`
+	Socks5Proxy string `json:"socks5_proxy,omitempty"`
+	// MultimodalModel 是可选的多模态模型：当请求本轮携带图片时，
+	// 路由切换到该模型（如 mimo）；纯文本仍走 TargetModel。
+	// 留空则不启用多模态路由（图片原样发给 TargetModel）。
+	MultimodalModel string `json:"multimodal_model,omitempty"`
+	// MultimodalUpstream 多模态模型可独立指定上游（与 TargetModel 不同上游）。
+	// 留空则复用 Upstream。
+	MultimodalUpstream string `json:"multimodal_upstream,omitempty"`
+	// MultimodalSocks5Proxy 多模态模型的独立代理出口。
+	// 留空则复用 Socks5Proxy。
+	MultimodalSocks5Proxy string `json:"multimodal_socks5_proxy,omitempty"`
 }
 
-type ClaudeMessage struct {
+// ======================== Anthropic Messages API 类型 ========================
+
+type AnthropicRequest struct {
+	Model       string             `json:"model"`
+	Messages    []AnthropicMessage `json:"messages"`
+	System      any                `json:"system,omitempty"`
+	MaxTokens   int                `json:"max_tokens,omitempty"`
+	Temperature *float64           `json:"temperature,omitempty"`
+	TopP        *float64           `json:"top_p,omitempty"`
+	Stream      bool               `json:"stream,omitempty"`
+	Tools       []AnthropicTool    `json:"tools,omitempty"`
+	ToolChoice  any                `json:"tool_choice,omitempty"`
+	Metadata    any                `json:"metadata,omitempty"`
+	Thinking    any                `json:"thinking,omitempty"`
+}
+
+type AnthropicMessage struct {
 	Role    string `json:"role"`
 	Content any    `json:"content"`
 }
 
-type ClaudeContent struct {
+type AnthropicContent struct {
 	Type      string `json:"type"`
 	Text      string `json:"text,omitempty"`
 	Thinking  string `json:"thinking,omitempty"`
@@ -694,23 +915,24 @@ type ClaudeContent struct {
 	Content   any    `json:"content,omitempty"`
 }
 
-type ClaudeTool struct {
+type AnthropicTool struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	InputSchema any    `json:"input_schema"`
 }
 
-type ClaudeResponse struct {
-	ID         string          `json:"id"`
-	Type       string          `json:"type"`
-	Role       string          `json:"role"`
-	Content    []ClaudeContent `json:"content"`
-	Model      string          `json:"model"`
-	StopReason string          `json:"stop_reason"`
-	Usage      *ClaudeUsage    `json:"usage,omitempty"`
+type AnthropicResponse struct {
+	ID           string             `json:"id"`
+	Type         string             `json:"type"`
+	Role         string             `json:"role"`
+	Content      []AnthropicContent `json:"content"`
+	Model        string             `json:"model"`
+	StopReason   string             `json:"stop_reason"`
+	StopSequence *string            `json:"stop_sequence"`
+	Usage        *AnthropicUsage    `json:"usage,omitempty"`
 }
 
-type ClaudeUsage struct {
+type AnthropicUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 }
@@ -776,11 +998,61 @@ func loadConfig(path string) AppConfig {
 
 func normalizeConfig(cfg *AppConfig) {
 	if cfg.ModelAlias == nil {
-		cfg.ModelAlias = map[string]string{}
+		cfg.ModelAlias = map[string]ModelAlias{}
+	}
+	for key, alias := range cfg.ModelAlias {
+		trimmedKey := strings.TrimSpace(key)
+		alias.TargetModel = strings.TrimSpace(alias.TargetModel)
+		alias.Upstream = strings.TrimSpace(alias.Upstream)
+		alias.Socks5Proxy = strings.TrimSpace(alias.Socks5Proxy)
+		alias.MultimodalModel = strings.TrimSpace(alias.MultimodalModel)
+		alias.MultimodalUpstream = strings.TrimSpace(alias.MultimodalUpstream)
+		alias.MultimodalSocks5Proxy = strings.TrimSpace(alias.MultimodalSocks5Proxy)
+		if trimmedKey == "" {
+			delete(cfg.ModelAlias, key)
+			continue
+		}
+		if trimmedKey != key {
+			delete(cfg.ModelAlias, key)
+		}
+		cfg.ModelAlias[trimmedKey] = alias
 	}
 
 	if cfg.ReasoningEffortMap == nil {
 		cfg.ReasoningEffortMap = map[string]string{}
+	}
+	normalizedProxies := make([]Socks5Proxy, 0, len(cfg.Socks5Proxies))
+	proxyAddresses := make(map[string]struct{}, len(cfg.Socks5Proxies))
+	for _, proxy := range cfg.Socks5Proxies {
+		proxy.Addr = strings.TrimSpace(proxy.Addr)
+		proxy.Name = strings.TrimSpace(proxy.Name)
+		if proxy.Addr == "" {
+			continue
+		}
+		if _, exists := proxyAddresses[proxy.Addr]; exists {
+			continue
+		}
+		proxyAddresses[proxy.Addr] = struct{}{}
+		normalizedProxies = append(normalizedProxies, proxy)
+	}
+	cfg.Socks5Proxies = normalizedProxies
+	// 不静默清空 alias.Socks5Proxy：保留引用，交由 adminConfigHandler POST 阶段
+	// 校验"孤儿代理引用"并返回 400，避免用户不知情地丢失配置。
+	if cfg.Upstreams == nil {
+		cfg.Upstreams = map[string]*UpstreamConfig{}
+	}
+	normalizedUpstreams := make(map[string]*UpstreamConfig, len(cfg.Upstreams))
+	for name, upstream := range cfg.Upstreams {
+		trimmedName := strings.TrimSpace(name)
+		copied := cloneUpstreamConfig(upstream)
+		if trimmedName == "" || !normalizeSingleUpstream(copied) {
+			continue
+		}
+		normalizedUpstreams[trimmedName] = copied
+	}
+	cfg.Upstreams = normalizedUpstreams
+	if len(cfg.Upstreams) == 0 {
+		return
 	}
 }
 
@@ -793,7 +1065,7 @@ func saveConfig(path string, cfg AppConfig) error {
 	return os.WriteFile(path, data, 0644)
 }
 
-func applyConfig(cfg AppConfig) {
+func applyConfig(cfg AppConfig) bool {
 	configMu.Lock()
 	defer configMu.Unlock()
 	if cfg.ModelAlias != nil {
@@ -803,43 +1075,105 @@ func applyConfig(cfg AppConfig) {
 	if cfg.ReasoningEffortMap != nil {
 		reasoningEffortMap = cfg.ReasoningEffortMap
 	}
-	forceDisableThinking = cfg.ForceDisableThinking
+	upstreamsChanged := upstreamsConfigChanged(upstreamCfgs, cfg.Upstreams)
+	upstreamCfgs = make(map[string]*UpstreamConfig, len(cfg.Upstreams))
+	for name, upstream := range cfg.Upstreams {
+		upstreamCfgs[name] = cloneUpstreamConfig(upstream)
+	}
 
 	socks5Mu.Lock()
-	proxiesUpdated := false
 	if cfg.Socks5Proxies != nil {
 		socks5Proxies = cfg.Socks5Proxies
-		proxiesUpdated = true
-	}
-	if proxiesUpdated || activeSocks5 != cfg.ActiveSocks5 {
-		activeSocks5 = cfg.ActiveSocks5
-		socks5Client = nil
-		socks5ClientAddr = ""
-		atomic.StoreUint32(&socks5RRIndex, 0)
-		atomic.StoreUint32(&socks5RateLimitIndex, 0)
 	}
 	socks5Mu.Unlock()
+	clearSocks5ClientCache()
 
+	return upstreamsChanged
 }
 
-func resolveModel(model string) string {
+// isKnownAlias 判断 model 是否为已配置且填写了 target_model 的别名。
+// 严格模式下客户端 model 必须是有效别名，否则推理请求将被拒绝。
+func isKnownAlias(model string) bool {
 	m := strings.TrimSpace(model)
+	if m == "" {
+		return false
+	}
 	configMu.RLock()
 	alias, ok := modelAlias[m]
 	configMu.RUnlock()
-	if ok {
-		return alias
-	}
-	return m
+	return ok && alias.TargetModel != ""
 }
 
-func getForceDisableThinking() bool {
+func resolveModel(model string) (string, ModelAlias, string, *UpstreamConfig) {
+	m := strings.TrimSpace(model)
+	alias := ModelAlias{}
+	configMu.RLock()
+	if found, ok := modelAlias[m]; ok {
+		alias = found
+	}
+	configMu.RUnlock()
+	if alias.TargetModel != "" {
+		m = alias.TargetModel
+	}
+	upstreamName, upstream := resolveUpstream(alias.Upstream)
+	if m == "" {
+		m = strings.TrimSpace(model)
+	}
+	return m, alias, upstreamName, upstream
+}
+
+// resolveEffectiveModel 根据是否多模态路由，返回最终使用的模型名、上游名、上游配置与代理 addr。
+// 多模态时若配置了独立的 multimodal_upstream / multimodal_socks5_proxy 则切换对应上游与代理；
+// 否则复用主上游与主代理。返回的 proxy 是代理 addr（若配置的是 name 则解析为 addr）。
+func resolveEffectiveModel(alias ModelAlias, baseModel string, baseUpstreamName string, baseUpstream *UpstreamConfig, useMultimodal bool) (string, string, *UpstreamConfig, string) {
+	if !useMultimodal {
+		return baseModel, baseUpstreamName, baseUpstream, alias.Socks5Proxy
+	}
+	mmModel := alias.MultimodalModel
+	if mmModel == "" {
+		return baseModel, baseUpstreamName, baseUpstream, alias.Socks5Proxy
+	}
+	mmUpstreamName := strings.TrimSpace(alias.MultimodalUpstream)
+	// 多模态代理：name → addr 解析；空则直连（不复用主代理），与 UI"直连"文案一致
+	mmProxy := resolveProxyAddr(alias.MultimodalSocks5Proxy)
+	if mmUpstreamName == "" {
+		// 复用主上游
+		return mmModel, baseUpstreamName, baseUpstream, mmProxy
+	}
+	// 切换到一个独立的多模态上游
+	upName, upCfg := resolveUpstream(mmUpstreamName)
+	if upCfg == nil {
+		// 多模态上游未配置，回退主上游
+		return mmModel, baseUpstreamName, baseUpstream, mmProxy
+	}
+	return mmModel, upName, upCfg, mmProxy
+}
+
+// resolveProxyAddr 将代理名（name）解析为 addr；若传入的已是 addr 则原样返回。
+// socks5 配置里 name 与 addr 都可能被引用，这里统一处理。
+func resolveProxyAddr(proxyRef string) string {
+	ref := strings.TrimSpace(proxyRef)
+	if ref == "" {
+		return ""
+	}
 	configMu.RLock()
 	defer configMu.RUnlock()
-	return forceDisableThinking
+	for _, p := range socks5Proxies {
+		if p.Addr == ref {
+			return p.Addr
+		}
+		if p.Name == ref {
+			return p.Addr
+		}
+	}
+	return ref
 }
 
-
+func getConfiguredUpstreamCount() int {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return len(upstreamCfgs)
+}
 
 func getReasoningEffortMap() map[string]string {
 	configMu.RLock()
@@ -944,49 +1278,701 @@ func recordTokenUsage(model string, promptTokens, completionTokens, totalTokens 
 
 // ======================== Thinking/Reasoning 判断 ========================
 
-func isThinkingEnabled(value any) bool {
+func numberFromAny(value any) (float64, bool) {
 	switch v := value.(type) {
-	case map[string]any:
-		t, _ := v["type"].(string)
-		return t == "enabled"
-	case bool:
-		return v
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case int32:
+		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
 	default:
-		return false
+		return 0, false
 	}
 }
 
-func isThinkingDisabled(value any) bool {
+func reasoningEffortFromThinking(value any) string {
 	switch v := value.(type) {
 	case map[string]any:
 		t, _ := v["type"].(string)
-		return t == "disabled"
+		switch strings.ToLower(t) {
+		case "disabled":
+			return "none"
+		case "adaptive":
+			return "xhigh"
+		case "enabled":
+			if budget, ok := numberFromAny(v["budget_tokens"]); ok && budget > 0 {
+				switch {
+				case budget < 4000:
+					return "low"
+				case budget <= 16000:
+					return "medium"
+				default:
+					return "high"
+				}
+			}
+			return "medium"
+		}
+	case map[string]string:
+		switch strings.ToLower(v["type"]) {
+		case "disabled":
+			return "none"
+		case "adaptive":
+			return "xhigh"
+		case "enabled":
+			return "medium"
+		}
 	case bool:
-		return !v
-	default:
-		return false
+		if v {
+			return "medium"
+		}
+		return "none"
 	}
+	return ""
 }
 
-func wantsReasoning(req *OpenAIRequest) bool {
-	if getForceDisableThinking() {
-		return false
+func ensureReasoningEffort(req *OpenAIRequest, alias ModelAlias) {
+	if req == nil || req.ReasoningEffort != "" {
+		return
 	}
-	if isThinkingDisabled(req.Thinking) {
-		return false
-	}
-	if isThinkingEnabled(req.Thinking) {
-		return true
+	if effort := reasoningEffortFromThinking(req.Thinking); effort != "" {
+		if effort != "none" {
+			req.ReasoningEffort = effort
+		}
+		return
 	}
 	if req.ExtraBody != nil {
-		if isThinkingDisabled(req.ExtraBody["thinking"]) {
-			return false
-		}
-		if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			return true
+		if effort := reasoningEffortFromThinking(req.ExtraBody["thinking"]); effort != "" {
+			if effort != "none" {
+				req.ReasoningEffort = effort
+			}
+			return
 		}
 	}
-	return true
+}
+
+func shouldUseLegacyResponsesReasoningEffort(upstream *UpstreamConfig) bool {
+	if upstream == nil {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(upstream.ResponsesReasoningFormat))
+	return v == "reasoning_effort" || v == "legacy" || v == "legacy_reasoning_effort"
+}
+
+func setResponsesReasoningEffort(req map[string]any, effort string, upstream *UpstreamConfig) {
+	if effort == "" || effort == "none" {
+		return
+	}
+	if shouldUseLegacyResponsesReasoningEffort(upstream) {
+		req["reasoning_effort"] = effort
+		return
+	}
+	req["reasoning"] = map[string]any{"effort": effort}
+}
+
+func mapConfiguredReasoningEffort(effort string) string {
+	if effort == "" {
+		return ""
+	}
+	effortMap := getReasoningEffortMap()
+	if mapped, ok := effortMap[effort]; ok {
+		return mapped
+	}
+	return effort
+}
+
+// ======================== 上游格式转换 ========================
+
+// reasoningEffortToAnthropicThinking maps OpenAI-compatible reasoning_effort
+// to Anthropic thinking with a default budget_tokens (required by Anthropic API).
+func reasoningEffortToAnthropicThinking(effort string) map[string]any {
+	switch strings.ToLower(effort) {
+	case "low":
+		return map[string]any{"type": "enabled", "budget_tokens": 4000}
+	case "medium":
+		return map[string]any{"type": "enabled", "budget_tokens": 16000}
+	case "high":
+		return map[string]any{"type": "enabled", "budget_tokens": 32000}
+	case "xhigh":
+		return map[string]any{"type": "enabled", "budget_tokens": 64000}
+	case "adaptive":
+		return map[string]any{"type": "enabled", "budget_tokens": 32000}
+	case "":
+		return nil
+	default:
+		return map[string]any{"type": "enabled", "budget_tokens": 16000}
+	}
+}
+
+// buildAnthropicThinking picks the Anthropic thinking config from an OpenAI-style
+// request body: prefer explicit thinking, fall back to reasoning_effort.
+func buildAnthropicThinking(req map[string]any) any {
+	if thinking, ok := req["thinking"]; ok {
+		if tm, ok := thinking.(map[string]any); ok {
+			if t, _ := tm["type"].(string); strings.EqualFold(t, "enabled") {
+				if _, has := tm["budget_tokens"]; !has {
+					tm["budget_tokens"] = 16000
+				}
+			}
+			return tm
+		}
+		if tm, ok := thinking.(map[string]string); ok {
+			switch strings.ToLower(tm["type"]) {
+			case "disabled":
+				return nil
+			case "enabled":
+				return map[string]any{"type": "enabled", "budget_tokens": 16000}
+			default:
+				return map[string]any{"type": tm["type"]}
+			}
+		}
+		return thinking
+	}
+	if re, ok := req["reasoning_effort"].(string); ok && re != "" && re != "none" {
+		return reasoningEffortToAnthropicThinking(re)
+	}
+	return nil
+}
+
+// openAIToAnthropicRequest 将 OpenAI Chat 请求转为 Anthropic Messages 格式
+func openAIToAnthropicRequest(body []byte) []byte {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	model, _ := req["model"].(string)
+	msgs, _ := req["messages"].([]any)
+
+	var systemTexts []string
+	var anthropicMsgs []map[string]any
+	handleContent := func(content any, role string) []map[string]any {
+		var blocks []map[string]any
+		switch c := content.(type) {
+		case string:
+			if c != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": c})
+			}
+		case []any:
+			for _, item := range c {
+				if p, ok := item.(map[string]any); ok {
+					switch p["type"] {
+					case "text":
+						if t, ok := p["text"].(string); ok && t != "" {
+							blocks = append(blocks, map[string]any{"type": "text", "text": t})
+						}
+					case "image_url":
+						blocks = append(blocks, convertOpenAIImageToAnthropic(p))
+					}
+				}
+			}
+		}
+		return blocks
+	}
+
+	for _, m := range msgs {
+		msg, _ := m.(map[string]any)
+		if msg == nil {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		content := msg["content"]
+
+		if role == "system" {
+			if s, ok := content.(string); ok {
+				systemTexts = append(systemTexts, s)
+			}
+			continue
+		}
+
+		if role == "assistant" {
+			var blocks []map[string]any
+
+			if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+				blocks = append(blocks, map[string]any{"type": "thinking", "thinking": rc})
+			}
+
+			blocks = append(blocks, handleContent(content, role)...)
+
+			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+				for _, tc := range tcs {
+					tcMap, _ := tc.(map[string]any)
+					id, _ := tcMap["id"].(string)
+					fn, _ := tcMap["function"].(map[string]any)
+					name, _ := fn["name"].(string)
+					var args any = map[string]any{}
+					if rawArgs, ok := fn["arguments"]; ok && rawArgs != nil {
+						switch v := rawArgs.(type) {
+						case string:
+							if v != "" {
+								var parsed any
+								if json.Unmarshal([]byte(v), &parsed) == nil {
+									args = parsed
+								}
+							}
+						default:
+							b, _ := json.Marshal(v)
+							var parsed any
+							if json.Unmarshal(b, &parsed) == nil {
+								args = parsed
+							}
+						}
+					}
+					blocks = append(blocks, map[string]any{
+						"type": "tool_use", "id": id, "name": name, "input": args,
+					})
+				}
+			}
+
+			if len(blocks) == 0 {
+				blocks = append(blocks, map[string]any{"type": "text", "text": ""})
+			}
+			anthropicMsgs = append(anthropicMsgs, map[string]any{"role": "assistant", "content": blocks})
+			continue
+		}
+
+		if role == "tool" {
+			toolCallID, _ := msg["tool_call_id"].(string)
+			var resultText string
+			if s, ok := content.(string); ok {
+				resultText = s
+			} else {
+				b, _ := json.Marshal(content)
+				resultText = string(b)
+			}
+			anthropicMsgs = append(anthropicMsgs, map[string]any{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "tool_result", "tool_use_id": toolCallID, "content": resultText},
+				},
+			})
+			continue
+		}
+
+		if role == "user" {
+			blocks := handleContent(content, role)
+			if len(blocks) == 0 {
+				continue
+			}
+			anthropicMsgs = append(anthropicMsgs, map[string]any{"role": "user", "content": blocks})
+		}
+	}
+
+	if len(anthropicMsgs) == 0 {
+		return body
+	}
+
+	anthropicReq := map[string]any{
+		"model":      model,
+		"messages":   anthropicMsgs,
+		"max_tokens": 4096,
+	}
+	if len(systemTexts) > 0 {
+		anthropicReq["system"] = strings.Join(systemTexts, "\n")
+	}
+	if stream, _ := req["stream"].(bool); stream {
+		anthropicReq["stream"] = true
+	}
+	// 同 openAIToResponsesRequest：按 key 存在性判断，保留显式传入的 0
+	if temp, ok := req["temperature"].(float64); ok {
+		anthropicReq["temperature"] = temp
+	}
+	if topP, ok := req["top_p"].(float64); ok {
+		anthropicReq["top_p"] = topP
+	}
+	if mt, _ := req["max_tokens"].(float64); mt > 0 {
+		anthropicReq["max_tokens"] = int(mt)
+	}
+	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+		anthropicReq["tools"] = convertOpenAIToolsToAnthropic(tools)
+	}
+	if tc, ok := req["tool_choice"]; ok {
+		switch v := tc.(type) {
+		case string:
+			// OpenAI: "auto", "none", "required" -> Anthropic: {type: ...}
+			switch v {
+			case "auto":
+				anthropicReq["tool_choice"] = map[string]any{"type": "auto"}
+			case "none":
+				anthropicReq["tool_choice"] = map[string]any{"type": "none"}
+			case "required":
+				anthropicReq["tool_choice"] = map[string]any{"type": "any"}
+			default:
+				anthropicReq["tool_choice"] = tc
+			}
+		case map[string]any:
+			// OpenAI: {"type": "function", "function": {"name": "xxx"}}
+			// Anthropic: {"type": "tool", "name": "xxx"}
+			if fn, ok := v["function"].(map[string]any); ok {
+				if name, ok := fn["name"].(string); ok && name != "" {
+					anthropicReq["tool_choice"] = map[string]any{"type": "tool", "name": name}
+				} else {
+					anthropicReq["tool_choice"] = map[string]any{"type": "auto"}
+				}
+			} else {
+				anthropicReq["tool_choice"] = tc
+			}
+		default:
+			anthropicReq["tool_choice"] = tc
+		}
+	}
+	if t := buildAnthropicThinking(req); t != nil {
+		anthropicReq["thinking"] = t
+	}
+
+	result, _ := json.Marshal(anthropicReq)
+	return result
+}
+
+func convertOpenAIImageToAnthropic(part map[string]any) map[string]any {
+	imgURL, _ := part["image_url"].(map[string]any)
+	if imgURL == nil {
+		return part
+	}
+	url, _ := imgURL["url"].(string)
+	if strings.HasPrefix(url, "data:") {
+		parts := strings.SplitN(url, ",", 2)
+		if len(parts) == 2 {
+			mediaType := strings.TrimPrefix(parts[0], "data:")
+			if idx := strings.Index(mediaType, ";"); idx >= 0 {
+				mediaType = mediaType[:idx]
+			}
+			return map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":       "base64",
+					"media_type": mediaType,
+					"data":       parts[1],
+				},
+			}
+		}
+	}
+	return map[string]any{
+		"type": "image",
+		"source": map[string]any{
+			"type": "url",
+			"url":  url,
+		},
+	}
+}
+
+func convertOpenAIToolsToAnthropic(tools []any) []map[string]any {
+	var result []map[string]any
+	for _, t := range tools {
+		tc, _ := t.(map[string]any)
+		if tc == nil {
+			continue
+		}
+		fn, _ := tc["function"].(map[string]any)
+		if fn == nil {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		desc, _ := fn["description"].(string)
+		params := fn["parameters"]
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		result = append(result, map[string]any{
+			"name": name, "description": desc, "input_schema": params,
+		})
+	}
+	return result
+}
+
+// openAIToResponsesRequest 将 OpenAI Chat 请求转为 OpenAI Responses API 格式
+// chatContentToResponsesInput 把 Chat 的 content 转为 Responses 的 content。
+// 纯文本返回 string（与历史行为一致）；含图片时返回 Responses parts 数组，
+// 避免多模态内容在转发到 Responses 上游时被丢弃。
+func chatContentToResponsesInput(content any) any {
+	parts, ok := content.([]any)
+	if !ok {
+		if s, ok := content.(string); ok {
+			return s
+		}
+		return extractTextFromContentParts(content)
+	}
+	var converted []any
+	var textParts []string
+	hasImage := false
+	for _, p := range parts {
+		part, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch part["type"] {
+		case "input_text", "output_text", "summary_text", "text":
+			if t, ok := part["text"].(string); ok && t != "" {
+				textParts = append(textParts, t)
+				converted = append(converted, map[string]any{"type": "input_text", "text": t})
+			}
+		case "image_url", "input_image":
+			imageURL := responsesImageURLFromPart(part)
+			if imageURL == nil {
+				continue
+			}
+			hasImage = true
+			// Responses 协议的 input_image.image_url 是字符串，不是对象
+			image := map[string]any{"type": "input_image", "image_url": imageURL["url"]}
+			if detail, ok := imageURL["detail"].(string); ok && detail != "" {
+				image["detail"] = detail
+			}
+			converted = append(converted, image)
+		}
+	}
+	if hasImage {
+		return converted
+	}
+	return strings.Join(textParts, "\n")
+}
+
+func openAIToResponsesRequest(body []byte, upstream *UpstreamConfig) []byte {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+	if err := normalizeRawMessagesToolCallArguments(req["messages"]); err != nil {
+		log.Printf("Warning: normalizeRawMessagesToolCallArguments failed: %v", err)
+	}
+
+	msgs, _ := req["messages"].([]any)
+	var instructions string
+	var input []map[string]any
+
+	for _, m := range msgs {
+		msg, _ := m.(map[string]any)
+		if msg == nil {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		content := msg["content"]
+
+		if role == "system" {
+			// content 可能是 string，也可能是 multi-part 数组，两种都要拍平进 instructions
+			if s := extractTextFromContentParts(content); s != "" {
+				if instructions == "" {
+					instructions = s
+				} else {
+					instructions += "\n" + s
+				}
+			}
+			continue
+		}
+
+		if role == "assistant" {
+			if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+				input = append(input, map[string]any{
+					"type":    "reasoning",
+					"summary": []any{map[string]any{"type": "summary_text", "text": rc}},
+				})
+			}
+			text := extractTextFromContentParts(content)
+			if text != "" {
+				input = append(input, map[string]any{
+					"role":    "assistant",
+					"content": text,
+				})
+			}
+			// Responses 协议要求 function_call 作为独立 item，不能挂在 assistant 消息上
+			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+				for _, tc := range tcs {
+					tcMap, _ := tc.(map[string]any)
+					id, _ := tcMap["id"].(string)
+					fn, _ := tcMap["function"].(map[string]any)
+					name, _ := fn["name"].(string)
+					args, _ := fn["arguments"].(string)
+					input = append(input, map[string]any{
+						"type":      "function_call",
+						"call_id":   id,
+						"name":      name,
+						"arguments": args,
+					})
+				}
+			}
+			continue
+		}
+
+		if role == "tool" {
+			// Responses 协议使用 function_call_output 而不是 role=tool 消息
+			toolCallID, _ := msg["tool_call_id"].(string)
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": toolCallID,
+				"output":  extractTextFromContentParts(content),
+			})
+			continue
+		}
+
+		// user / 其他角色（保留图片等非文本 part）
+		input = append(input, map[string]any{
+			"role":    role,
+			"content": chatContentToResponsesInput(content),
+		})
+	}
+
+	respReq := map[string]any{
+		"model": req["model"],
+	}
+	if instructions != "" {
+		respReq["instructions"] = instructions
+	}
+	if len(input) > 0 {
+		respReq["input"] = input
+	}
+	if stream, _ := req["stream"].(bool); stream {
+		respReq["stream"] = true
+	}
+	// key 存在即代表调用方显式设置过（convertRequest 只在非 nil 时写入），
+	// 因此按 key 存在性判断，不能用零值判断，否则显式的 0 会被丢掉
+	if temp, ok := req["temperature"].(float64); ok {
+		respReq["temperature"] = temp
+	}
+	if topP, ok := req["top_p"].(float64); ok {
+		respReq["top_p"] = topP
+	}
+	if mt, _ := req["max_tokens"].(float64); mt > 0 {
+		respReq["max_output_tokens"] = int(mt)
+	}
+	if tools, ok := req["tools"].([]any); ok && len(tools) > 0 {
+		respReq["tools"] = convertChatToolsToResponses(tools)
+	}
+	if tc, ok := req["tool_choice"]; ok {
+		respReq["tool_choice"] = convertChatToolChoiceToResponses(tc)
+	}
+	if ptc, ok := req["parallel_tool_calls"]; ok {
+		respReq["parallel_tool_calls"] = ptc
+	}
+	if re, ok := req["reasoning_effort"].(string); ok && re != "" {
+		setResponsesReasoningEffort(respReq, mapConfiguredReasoningEffort(re), upstream)
+	} else if effort := reasoningEffortFromThinking(req["thinking"]); effort != "" && effort != "none" {
+		setResponsesReasoningEffort(respReq, mapConfiguredReasoningEffort(effort), upstream)
+	}
+
+	result, _ := json.Marshal(respReq)
+	return result
+}
+
+// convertResponsesToChat 将 OpenAI Responses API 响应转为 OpenAI Chat 格式
+func convertResponsesToChat(body []byte, modelID string) []byte {
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+
+	totalText := ""
+	totalReasoning := ""
+	var toolCalls []map[string]any
+	if output, ok := resp["output"].([]any); ok {
+		for _, item := range output {
+			if m, ok := item.(map[string]any); ok {
+				switch m["type"] {
+				case "reasoning":
+					reasoning := ""
+					if summary, ok := m["summary"].([]any); ok {
+						for _, s := range summary {
+							if sm, ok := s.(map[string]any); ok {
+								if t, ok := sm["text"].(string); ok {
+									reasoning += t
+								}
+							}
+						}
+					}
+					if reasoning == "" {
+						if ec, ok := m["encrypted_content"].(string); ok && ec != "" {
+							reasoning = ec
+						}
+					}
+					if reasoning != "" {
+						totalReasoning += reasoning
+					}
+				case "message":
+					if content, ok := m["content"].([]any); ok {
+						for _, block := range content {
+							if b, ok := block.(map[string]any); ok {
+								switch b["type"] {
+								case "output_text":
+									if t, ok := b["text"].(string); ok {
+										totalText += t
+									}
+								}
+							}
+						}
+					}
+				case "function_call":
+					callID, _ := m["call_id"].(string)
+					name, _ := m["name"].(string)
+					args, _ := m["arguments"].(string)
+					toolCalls = append(toolCalls, map[string]any{
+						"id":   callID,
+						"type": "function",
+						"function": map[string]any{
+							"name":      name,
+							"arguments": args,
+						},
+					})
+				}
+			}
+		}
+	}
+
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+	}
+	if status, _ := resp["status"].(string); status == "incomplete" {
+		finishReason = "length"
+	}
+	message := map[string]any{
+		"role":    "assistant",
+		"content": totalText,
+	}
+	if totalReasoning != "" {
+		message["reasoning_content"] = totalReasoning
+	}
+	choice := map[string]any{
+		"index":         0,
+		"message":       message,
+		"finish_reason": finishReason,
+	}
+	if resp["id"] == nil {
+		resp["id"] = "resp_" + randomString(16)
+	}
+	if len(toolCalls) > 0 {
+		choice["message"].(map[string]any)["tool_calls"] = toolCalls
+	}
+
+	chatResp := map[string]any{
+		"id":      resp["id"],
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   modelID,
+		"choices": []map[string]any{choice},
+	}
+	if usage, ok := resp["usage"]; ok {
+		// Responses 用 input_tokens/output_tokens，Chat 客户端读 prompt_tokens/completion_tokens。
+		// 归一成 Chat 字段名，同时保留原始字段（含 *_tokens_details 等细节）供下游转换使用。
+		if um, ok := usage.(map[string]any); ok {
+			merged := responsesUsageToChatUsage(um)
+			for k, v := range um {
+				if _, exists := merged[k]; !exists {
+					merged[k] = v
+				}
+			}
+			chatResp["usage"] = merged
+		} else {
+			chatResp["usage"] = usage
+		}
+	}
+
+	result, _ := json.Marshal(chatResp)
+	return result
 }
 
 // ======================== 消息处理 ========================
@@ -1040,10 +2026,177 @@ func fixToolCallGaps(messages []Message) []Message {
 	return fixed
 }
 
-func ensureReasoningContent(messages []Message, thinking bool) []Message {
-	if !thinking {
-		return messages
+func normalizeToolCallArguments(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "{}", nil
 	}
+	var parsed any
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return "", err
+	}
+	obj, ok := parsed.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("must decode to JSON object, got %T", parsed)
+	}
+	normalized, err := json.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+	return string(normalized), nil
+}
+
+func toolCallArgumentsPreview(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	return truncatePreview(raw, 160)
+}
+
+func truncatePreview(raw string, limit int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	runes := []rune(raw)
+	if limit > 0 && len(runes) > limit {
+		return string(runes[:limit]) + "..."
+	}
+	return raw
+}
+
+func messageContentPreview(content any) string {
+	switch v := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return truncatePreview(v, 160)
+	case []any:
+		return truncatePreview(extractTextFromContentParts(v), 160)
+	default:
+		b, _ := json.Marshal(v)
+		return truncatePreview(string(b), 160)
+	}
+}
+
+func logToolCallArgumentsValidationFailure(source string, messageIndex, toolCallIndex int, toolCallID, toolName, rawArgs string, content any, err error) {
+	log.Printf("[tool-call arguments invalid] source=%s message_index=%d tool_call_index=%d tool_call_id=%q tool_name=%q arguments_len=%d arguments_preview=%q content_preview=%q err=%v",
+		source,
+		messageIndex,
+		toolCallIndex,
+		toolCallID,
+		toolName,
+		len(rawArgs),
+		toolCallArgumentsPreview(rawArgs),
+		messageContentPreview(content),
+		err,
+	)
+}
+
+func logStreamToolCallArgumentsValidationFailure(source, itemID, callID, toolName, rawArgs string, outputIndex int, err error) {
+	log.Printf("[tool-call stream invalid] source=%s item_id=%q output_index=%d tool_call_id=%q tool_name=%q arguments_len=%d arguments_preview=%q err=%v",
+		source,
+		itemID,
+		outputIndex,
+		callID,
+		toolName,
+		len(rawArgs),
+		toolCallArgumentsPreview(rawArgs),
+		err,
+	)
+}
+
+func normalizeMessagesToolCallArguments(messages []Message) ([]Message, error) {
+	for i := range messages {
+		if messages[i].Role != "assistant" || len(messages[i].ToolCalls) == 0 {
+			continue
+		}
+		for j := range messages[i].ToolCalls {
+			normalized, err := normalizeToolCallArguments(messages[i].ToolCalls[j].Function.Arguments)
+			if err != nil {
+				logToolCallArgumentsValidationFailure(
+					"normalizeMessagesToolCallArguments",
+					i,
+					j,
+					messages[i].ToolCalls[j].ID,
+					messages[i].ToolCalls[j].Function.Name,
+					messages[i].ToolCalls[j].Function.Arguments,
+					messages[i].Content,
+					err,
+				)
+				return nil, fmt.Errorf("messages[%d].tool_calls[%d].function.arguments invalid JSON object string: %w; preview=%q", i, j, err, toolCallArgumentsPreview(messages[i].ToolCalls[j].Function.Arguments))
+			}
+			messages[i].ToolCalls[j].Function.Arguments = normalized
+		}
+	}
+	return messages, nil
+}
+
+func normalizeRawMessagesToolCallArguments(rawMessages any) error {
+	msgs, ok := rawMessages.([]any)
+	if !ok {
+		return nil
+	}
+	for i, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok || msg == nil {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		rawToolCalls, ok := msg["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+		for j, rawToolCall := range rawToolCalls {
+			tc, ok := rawToolCall.(map[string]any)
+			if !ok || tc == nil {
+				continue
+			}
+			toolCallID, _ := tc["id"].(string)
+			fn, ok := tc["function"].(map[string]any)
+			if !ok || fn == nil {
+				continue
+			}
+			toolName, _ := fn["name"].(string)
+			var rawArgs string
+			switch v := fn["arguments"].(type) {
+			case string:
+				rawArgs = v
+			case nil:
+				rawArgs = ""
+			default:
+				b, _ := json.Marshal(v)
+				rawArgs = string(b)
+			}
+			normalized, err := normalizeToolCallArguments(rawArgs)
+			if err != nil {
+				logToolCallArgumentsValidationFailure(
+					"normalizeRawMessagesToolCallArguments",
+					i,
+					j,
+					toolCallID,
+					toolName,
+					rawArgs,
+					msg["content"],
+					err,
+				)
+				return fmt.Errorf("messages[%d].tool_calls[%d].function.arguments invalid JSON object string: %w; preview=%q", i, j, err, toolCallArgumentsPreview(rawArgs))
+			}
+			fn["arguments"] = normalized
+		}
+	}
+	return nil
+}
+
+// ensureReasoningContent 为历史 assistant 消息补齐空的 reasoning_content 占位。
+// 对标 opencode2api：thinking 模式上游（DeepSeek）要求所有历史 assistant 消息
+// 必须回传 reasoning_content（可为空串），缺失会报 invalid_request_error。
+// 始终生效：对标 opencode2api，thinking 模式上游要求回传 reasoning_content。
+func ensureReasoningContent(messages []Message) []Message {
 	for i := range messages {
 		if messages[i].Role == "assistant" && messages[i].ReasoningContent == nil {
 			empty := ""
@@ -1062,10 +2215,73 @@ func convertMessagesForUpstream(messages []Message) []map[string]any {
 		}
 		content := normalizeContent(msg.Content)
 		reasoningContent := msg.ReasoningContent
+		// Strip x-anthropic-billing-header from system messages
+		if msg.Role == "system" {
+			if s, ok := content.(string); ok {
+				content = strings.TrimSpace(reBillingHeader.ReplaceAllString(s, ""))
+				if content == "" {
+					continue
+				}
+			} else if s, ok := content.([]any); ok {
+				// Handle multi-part content in system messages
+				var cleaned []any
+				for _, part := range s {
+					p, ok := part.(map[string]any)
+					if !ok {
+						continue
+					}
+					if txt, ok := p["text"].(string); ok {
+						txt = strings.TrimSpace(reBillingHeader.ReplaceAllString(txt, ""))
+						if txt != "" {
+							p["text"] = txt
+							cleaned = append(cleaned, p)
+						}
+					}
+				}
+				if len(cleaned) == 0 {
+					continue
+				}
+				content = cleaned
+			}
+		}
+		shouldSendContent := content != nil
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			switch v := content.(type) {
+			case string:
+				shouldSendContent = strings.TrimSpace(v) != ""
+			case []any:
+				shouldSendContent = len(v) > 0
+			}
+		}
 		if content != nil {
+			// 兼容严格要求 content 全为 block 数组的上游（如 zen/serde）：
+			// ① 字符串 content → text block 数组（OpenAI 上游也接受，无副作用）
+			// ② content 数组内若有裸字符串元素（混合结构残留）→ 包成 text block
+			if msg.Role != "tool" {
+				if s, ok := content.(string); ok {
+					content = []any{map[string]any{"type": "text", "text": s}}
+				} else if arr, ok := content.([]any); ok {
+					for _, p := range arr {
+						if _, ok := p.(string); ok {
+							normalized := make([]any, 0, len(arr))
+							for _, item := range arr {
+								if s, ok := item.(string); ok {
+									normalized = append(normalized, map[string]any{"type": "text", "text": s})
+								} else {
+									normalized = append(normalized, item)
+								}
+							}
+							content = normalized
+							break
+						}
+					}
+				}
+			}
+		}
+		if shouldSendContent {
 			clean["content"] = content
 		}
-		if reasoningContent != nil {
+		if reasoningContent != nil && *reasoningContent != "" {
 			clean["reasoning_content"] = *reasoningContent
 		}
 		if len(msg.ToolCalls) > 0 {
@@ -1084,32 +2300,6 @@ func convertMessagesForUpstream(messages []Message) []map[string]any {
 
 // ======================== 完整请求转换（含 thinking/reasoning_effort/ExtraBody） ========================
 
-func thinkingMap(converted map[string]any) map[string]any {
-	if existing, ok := converted["thinking"].(map[string]any); ok {
-		return existing
-	}
-	if existing, ok := converted["thinking"].(map[string]string); ok {
-		m := map[string]any{}
-		for k, v := range existing {
-			m[k] = v
-		}
-		converted["thinking"] = m
-		return m
-	}
-	m := map[string]any{}
-	converted["thinking"] = m
-	return m
-}
-
-func setThinkingEnabled(converted map[string]any) {
-	m := thinkingMap(converted)
-	m["type"] = "enabled"
-}
-
-func setThinkingDisabled(converted map[string]any) {
-	converted["thinking"] = map[string]string{"type": "disabled"}
-}
-
 func convertRequest(req *OpenAIRequest) map[string]any {
 	converted := map[string]any{
 		"model":    req.Model,
@@ -1122,6 +2312,17 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if req.MaxTokens != 0 {
 		converted["max_tokens"] = req.MaxTokens
 	}
+	// Inject stream_options.include_usage for streaming requests.
+	if req.Stream {
+		streamOptions := map[string]any{"include_usage": true}
+		if existing, ok := req.StreamOptions.(map[string]any); ok {
+			for k, v := range existing {
+				streamOptions[k] = v
+			}
+			streamOptions["include_usage"] = true
+		}
+		converted["stream_options"] = streamOptions
+	}
 	if req.TopP != nil {
 		converted["top_p"] = *req.TopP
 	}
@@ -1131,30 +2332,33 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	if req.ToolChoice != nil {
 		converted["tool_choice"] = req.ToolChoice
 	}
-	// 处理思维模式 — 仅当用户显式指定时才发送，避免 MiniMax 等模型报错
-	if getForceDisableThinking() || isThinkingDisabled(req.Thinking) {
-		converted["thinking"] = map[string]string{"type": "disabled"}
-	} else if req.Thinking != nil && isThinkingEnabled(req.Thinking) {
-		converted["thinking"] = map[string]string{"type": "enabled"}
+
+	// thinking/reasoning_effort describe the current request and are independent
+	if req.Thinking != nil {
+		converted["thinking"] = req.Thinking
 	} else if req.ExtraBody != nil {
-		if isThinkingDisabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = map[string]string{"type": "disabled"}
-		} else if isThinkingEnabled(req.ExtraBody["thinking"]) {
-			converted["thinking"] = map[string]string{"type": "enabled"}
+		if thinking, ok := req.ExtraBody["thinking"]; ok && thinking != nil {
+			converted["thinking"] = thinking
 		}
 	}
-	// 处理 reasoning_effort
-	if !getForceDisableThinking() && req.ReasoningEffort != "" {
+	effort := req.ReasoningEffort
+	if effort == "" && req.ExtraBody != nil {
+		effort, _ = req.ExtraBody["reasoning_effort"].(string)
+	}
+	if effort != "" {
 		effortMap := getReasoningEffortMap()
-		if mapped, ok := effortMap[req.ReasoningEffort]; ok {
+		if mapped, ok := effortMap[effort]; ok {
 			converted["reasoning_effort"] = mapped
 		} else {
-			converted["reasoning_effort"] = req.ReasoningEffort
+			converted["reasoning_effort"] = effort
 		}
 	}
-	// 合并 ExtraBody
+
 	if req.ExtraBody != nil {
 		for k, v := range req.ExtraBody {
+			if k == "thinking" || k == "reasoning_effort" {
+				continue
+			}
 			if _, exists := converted[k]; !exists {
 				converted[k] = v
 			}
@@ -1162,7 +2366,6 @@ func convertRequest(req *OpenAIRequest) map[string]any {
 	}
 	return converted
 }
-
 func buildUpstreamBody(req *OpenAIRequest) []byte {
 	converted := convertRequest(req)
 	b, err := json.Marshal(converted)
@@ -1202,10 +2405,10 @@ func isAnthropicFormat(body []byte) bool {
 	return false
 }
 
-func parseAnthropicSSE(body []byte) (map[string]any, string, []map[string]any) {
+func parseAnthropicSSE(body []byte) (map[string]any, string, string, []map[string]any) {
 	lines := bytes.Split(body, []byte("\n"))
 	var anthropicMsg map[string]any
-	var textBuilder, currentToolInputBuilder strings.Builder
+	var textBuilder, thinkingBuilder, currentToolInputBuilder strings.Builder
 	var currentToolUse map[string]any
 	var toolUseBlocks []map[string]any
 	for _, line := range lines {
@@ -1234,6 +2437,11 @@ func parseAnthropicSSE(body []byte) (map[string]any, string, []map[string]any) {
 			if delta, ok := event["delta"].(map[string]any); ok {
 				if t, ok := delta["text"].(string); ok {
 					textBuilder.WriteString(t)
+				}
+				if dt, _ := delta["type"].(string); dt == "thinking_delta" {
+					if th, ok := delta["thinking"].(string); ok {
+						thinkingBuilder.WriteString(th)
+					}
 				}
 				if dt, _ := delta["type"].(string); dt == "input_json_delta" {
 					if partial, ok := delta["partial_json"].(string); ok {
@@ -1267,13 +2475,13 @@ func parseAnthropicSSE(body []byte) (map[string]any, string, []map[string]any) {
 			}
 		case "message_stop":
 		case "error":
-			return nil, "", nil
+			return nil, "", "", nil
 		}
 	}
-	return anthropicMsg, textBuilder.String(), toolUseBlocks
+	return anthropicMsg, textBuilder.String(), thinkingBuilder.String(), toolUseBlocks
 }
 
-func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks []map[string]any, modelID string) []byte {
+func buildOpenAIResponse(anthropicMsg map[string]any, text string, reasoning string, toolUseBlocks []map[string]any, modelID string) []byte {
 	if anthropicMsg == nil {
 		return nil
 	}
@@ -1285,10 +2493,18 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks
 	finishReason, _ := anthropicMsg["stop_reason"].(string)
 	if finishReason == "tool_use" {
 		finishReason = "tool_calls"
+	} else if finishReason == "end_turn" {
+		finishReason = "stop"
+	} else if finishReason == "max_tokens" {
+		finishReason = "length"
+	}
+	message := map[string]any{"role": role, "content": text}
+	if reasoning != "" {
+		message["reasoning_content"] = reasoning
 	}
 	choice := map[string]any{
 		"index":         0,
-		"message":       map[string]any{"role": role, "content": text},
+		"message":       message,
 		"finish_reason": finishReason,
 	}
 	if len(toolUseBlocks) > 0 {
@@ -1317,8 +2533,22 @@ func buildOpenAIResponse(anthropicMsg map[string]any, text string, toolUseBlocks
 		"model":   modelID,
 		"choices": []map[string]any{choice},
 	}
-	if usage, ok := anthropicMsg["usage"]; ok {
-		resp["usage"] = usage
+	if usage, ok := anthropicMsg["usage"].(map[string]any); ok {
+		openAIUsage := map[string]any{}
+		if v, ok := usage["input_tokens"]; ok {
+			openAIUsage["prompt_tokens"] = v
+		}
+		if v, ok := usage["output_tokens"]; ok {
+			openAIUsage["completion_tokens"] = v
+		}
+		if pt, ok1 := openAIUsage["prompt_tokens"]; ok1 {
+			if ct, ok2 := openAIUsage["completion_tokens"]; ok2 {
+				ptF, _ := pt.(float64)
+				ctF, _ := ct.(float64)
+				openAIUsage["total_tokens"] = int64(ptF + ctF)
+			}
+		}
+		resp["usage"] = openAIUsage
 	}
 	result, _ := json.Marshal(resp)
 	return result
@@ -1329,6 +2559,7 @@ func convertAnthropicMessageToOpenAI(msg map[string]any, modelID string) []byte 
 		msg["model"] = modelID
 	}
 	var textBuilder strings.Builder
+	var thinkingBuilder strings.Builder
 	var toolUses []map[string]any
 	if content, ok := msg["content"].([]any); ok {
 		for _, c := range content {
@@ -1338,13 +2569,17 @@ func convertAnthropicMessageToOpenAI(msg map[string]any, modelID string) []byte 
 					if t, ok := block["text"].(string); ok {
 						textBuilder.WriteString(t)
 					}
+				case "thinking":
+					if t, ok := block["thinking"].(string); ok {
+						thinkingBuilder.WriteString(t)
+					}
 				case "tool_use":
 					toolUses = append(toolUses, block)
 				}
 			}
 		}
 	}
-	return buildOpenAIResponse(msg, textBuilder.String(), toolUses, modelID)
+	return buildOpenAIResponse(msg, textBuilder.String(), thinkingBuilder.String(), toolUses, modelID)
 }
 
 func convertAnthropicToOpenAI(body []byte, modelID string) []byte {
@@ -1354,14 +2589,14 @@ func convertAnthropicToOpenAI(body []byte, modelID string) []byte {
 			return convertAnthropicMessageToOpenAI(singleMsg, modelID)
 		}
 	}
-	msg, text, toolUses := parseAnthropicSSE(body)
+	msg, text, reasoning, toolUses := parseAnthropicSSE(body)
 	if msg == nil {
 		return body
 	}
 	if msg["model"] == nil {
 		msg["model"] = modelID
 	}
-	return buildOpenAIResponse(msg, text, toolUses, modelID)
+	return buildOpenAIResponse(msg, text, reasoning, toolUses, modelID)
 }
 
 // ======================== 响应清理 ========================
@@ -1378,22 +2613,43 @@ func cleanNulls(m map[string]any) {
 	}
 }
 
-func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
+func hasNonEmptyString(value any) bool {
+	s, ok := value.(string)
+	return ok && s != ""
+}
+
+func normalizeReasoningContent(m map[string]any) {
+	if m == nil || hasNonEmptyString(m["reasoning_content"]) {
+		return
+	}
+	if v, ok := m["reasoning"]; ok {
+		m["reasoning_content"] = v
+	}
+}
+
+func cleanStreamDelta(delta map[string]any) {
+	normalizeReasoningContent(delta)
 	if v, ok := delta["content"]; ok && v == nil {
 		delete(delta, "content")
 	}
 	if s, ok := delta["content"].(string); ok && s == "" {
 		delete(delta, "content")
 	}
-	if !keepReasoning {
+	if v, ok := delta["reasoning_content"]; ok && v == nil {
 		delete(delta, "reasoning_content")
-	} else {
-		if v, ok := delta["reasoning_content"]; ok && v == nil {
-			delete(delta, "reasoning_content")
-		}
-		if s, ok := delta["reasoning_content"].(string); ok && s == "" {
-			delete(delta, "reasoning_content")
-		}
+	}
+	if s, ok := delta["reasoning_content"].(string); ok && s == "" {
+		delete(delta, "reasoning_content")
+	}
+	// 删除与 reasoning_content 重复的 reasoning 字段
+	if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
+		delete(delta, "reasoning")
+	}
+	if v, ok := delta["reasoning"]; ok && v == nil {
+		delete(delta, "reasoning")
+	}
+	if s, ok := delta["reasoning"].(string); ok && s == "" {
+		delete(delta, "reasoning")
 	}
 	if s, ok := delta["role"].(string); ok && s == "" {
 		delete(delta, "role")
@@ -1401,7 +2657,7 @@ func cleanStreamDelta(delta map[string]any, keepReasoning bool) {
 }
 
 // convertStreamChunkWithUsage 转换流式 chunk 并同时提取 usage，避免二次解析
-func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[string]any) {
+func convertStreamChunkWithUsage(line string) (string, map[string]any) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
 		return line, nil
@@ -1423,6 +2679,23 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 
 	choices, ok := raw["choices"].([]any)
 	if !ok || len(choices) == 0 {
+		// choices 为空但有 usage 时，仍需转发给客户端
+		if usage != nil {
+			raw["choices"] = []any{}
+			delete(raw, "cost")
+			delete(raw, "service_tier")
+			delete(raw, "prompt_logprobs")
+			delete(raw, "prompt_token_ids")
+			delete(raw, "kv_transfer_params")
+			if v, ok := raw["usage"]; ok && v == nil {
+				delete(raw, "usage")
+			}
+			converted, err := json.Marshal(raw)
+			if err != nil {
+				return "", usage
+			}
+			return "data: " + string(converted), usage
+		}
 		return "", usage
 	}
 	for i, c := range choices {
@@ -1431,14 +2704,12 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 			continue
 		}
 		if delta, ok := choice["delta"].(map[string]any); ok {
-			cleanStreamDelta(delta, keepReasoning)
+			cleanStreamDelta(delta)
 			choice["delta"] = delta
 		}
 		if msg, ok := choice["message"].(map[string]any); ok {
+			normalizeReasoningContent(msg)
 			cleanNulls(msg)
-			if !keepReasoning {
-				delete(msg, "reasoning_content")
-			}
 			choice["message"] = msg
 		}
 		if v, ok := choice["logprobs"]; ok && v == nil {
@@ -1450,6 +2721,9 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 		if s, ok := choice["finish_reason"].(string); ok && s == "" {
 			delete(choice, "finish_reason")
 		}
+		// 清理上游扩展字段
+		delete(choice, "stop_reason")
+		delete(choice, "token_ids")
 		choices[i] = choice
 	}
 	raw["choices"] = choices
@@ -1457,6 +2731,10 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 		delete(raw, "usage")
 	}
 	delete(raw, "cost")
+	delete(raw, "service_tier")
+	delete(raw, "prompt_logprobs")
+	delete(raw, "prompt_token_ids")
+	delete(raw, "kv_transfer_params")
 	converted, err := json.Marshal(raw)
 	if err != nil {
 		return line, usage
@@ -1464,7 +2742,7 @@ func convertStreamChunkWithUsage(line string, keepReasoning bool) (string, map[s
 	return "data: " + string(converted), usage
 }
 
-func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
+func convertResponse(data []byte) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		log.Printf("Warning: convertResponse unmarshal failed: %v", err)
@@ -1474,230 +2752,756 @@ func convertResponse(data []byte, keepReasoning bool) ([]byte, error) {
 		for i, c := range choices {
 			if choice, ok := c.(map[string]any); ok {
 				if msg, ok := choice["message"].(map[string]any); ok {
-					cleanNulls(msg)
-					if !keepReasoning {
-						delete(msg, "reasoning_content")
+					normalizeReasoningContent(msg)
+					// 删除与 reasoning_content 重复的 reasoning 字段
+					if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
+						delete(msg, "reasoning")
 					}
+					cleanNulls(msg)
 					choice["message"] = msg
 				}
 				if v, ok := choice["logprobs"]; ok && v == nil {
 					delete(choice, "logprobs")
 				}
+				// 清理上游扩展字段
+				delete(choice, "stop_reason")
+				delete(choice, "token_ids")
 				choices[i] = choice
 			}
 		}
 		raw["choices"] = choices
 	}
 	if usage, ok := raw["usage"].(map[string]any); ok {
-		cleanU := map[string]any{
-			"prompt_tokens":     usage["prompt_tokens"],
-			"completion_tokens": usage["completion_tokens"],
-			"total_tokens":      usage["total_tokens"],
+		cleanU := map[string]any{}
+		if v, ok := usage["prompt_tokens"]; ok && v != nil {
+			cleanU["prompt_tokens"] = v
 		}
-		raw["usage"] = cleanU
+		if v, ok := usage["completion_tokens"]; ok && v != nil {
+			cleanU["completion_tokens"] = v
+		}
+		if v, ok := usage["total_tokens"]; ok && v != nil {
+			cleanU["total_tokens"] = v
+		}
+		if len(cleanU) > 0 {
+			raw["usage"] = cleanU
+		} else {
+			delete(raw, "usage")
+		}
 	}
+	// 清理上游顶层扩展字段
 	delete(raw, "cost")
-	delete(raw, "system_fingerprint")
+	delete(raw, "service_tier")
+	delete(raw, "prompt_logprobs")
+	delete(raw, "prompt_token_ids")
+	delete(raw, "kv_transfer_params")
 	return json.Marshal(raw)
 }
 
-func cloneBodyMap(bodyMap map[string]any) map[string]any {
-	cp := make(map[string]any, len(bodyMap)+1)
-	for k, v := range bodyMap {
-		cp[k] = v
+// ======================== 上游端点 ========================
+
+func getUpstreamEndpoint(upstream *UpstreamConfig) string {
+	if upstream == nil || upstream.BaseURL == "" {
+		return ""
 	}
-	if thinking, ok := cp["thinking"].(map[string]any); ok {
-		clone := make(map[string]any, len(thinking))
-		for k, v := range thinking {
-			clone[k] = v
-		}
-		cp["thinking"] = clone
+	base := strings.TrimRight(upstream.BaseURL, "/")
+	switch upstream.APIType {
+	case UpstreamOpenAI:
+		return base + "/chat/completions"
+	case UpstreamAnthropic:
+		return base + "/messages"
+	case UpstreamResponses:
+		return base + "/responses"
+	default:
+		return base + "/chat/completions"
 	}
-	if thinking, ok := cp["thinking"].(map[string]string); ok {
-		clone := make(map[string]any, len(thinking))
-		for k, v := range thinking {
-			clone[k] = v
-		}
-		cp["thinking"] = clone
-	}
-	if messages, ok := cp["messages"].([]map[string]any); ok {
-		clone := make([]map[string]any, 0, len(messages))
-		for _, msg := range messages {
-			msgClone := make(map[string]any, len(msg))
-			for k, v := range msg {
-				msgClone[k] = v
-			}
-			clone = append(clone, msgClone)
-		}
-		cp["messages"] = clone
-	}
-	if messages, ok := cp["messages"].([]any); ok {
-		clone := make([]any, 0, len(messages))
-		for _, item := range messages {
-			if msg, ok := item.(map[string]any); ok {
-				msgClone := make(map[string]any, len(msg))
-				for k, v := range msg {
-					msgClone[k] = v
-				}
-				clone = append(clone, msgClone)
-			} else {
-				clone = append(clone, item)
-			}
-		}
-		cp["messages"] = clone
-	}
-	return cp
 }
 
-func buildOCRequest(modelID string, bodyMap map[string]any) (*http.Request, error) {
-	tryBody, err := json.Marshal(bodyMap)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest("POST", "https://opencode.ai/zen/v1/chat/completions", bytes.NewReader(tryBody))
+func buildUpstreamRequest(endpoint, apiKey string, body []byte, upstream *UpstreamConfig) (*http.Request, error) {
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s", ocClientVer))
-	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-project", ocProjectID)
-	req.Header.Set("x-opencode-session", ocSessionID)
-	req.Header.Set("x-opencode-request", "req_"+randomString(24))
+	if apiKey != "" {
+		if upstream != nil && upstream.APIType == UpstreamAnthropic {
+			req.Header.Set("x-api-key", apiKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+			req.Header.Set("anthropic-beta", "prompt-caching-2025-01-31")
+		} else {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+	}
 	req.Header.Set("Accept", "application/json")
 	return req, nil
 }
 
-func callOpenCodeAPI(upstreamBody []byte, modelID string) ([]byte, int, http.Header, error) {
-	initOCSession()
-	modelIDs := getModelIDs()
-	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
-		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
-
-	// 循环外解析一次
+func prepareOpenAIUpstreamBody(reqBody []byte, modelID string, upstream *UpstreamConfig) ([]byte, error) {
 	var bodyMap map[string]any
-	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
-		return nil, 500, nil, fmt.Errorf("invalid request body")
+	if err := json.Unmarshal(reqBody, &bodyMap); err != nil {
+		return nil, fmt.Errorf("invalid request body")
 	}
-
-	var lastErr error
-	var lastBody []byte
-	var lastStatus int
-	var lastHeader http.Header
-	for _, tryModel := range modelsToTry {
-		attempts := socks5RateLimitAttemptCount()
-		for attempt := 0; attempt < attempts; attempt++ {
-			up, err := buildOCRequest(tryModel, bodyMap)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			resp, err := getHTTPClient().Do(up)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				b, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if readErr != nil {
-					return nil, 0, nil, readErr
-				}
-				if isAnthropicFormat(b) {
-					b = convertAnthropicToOpenAI(b, tryModel)
-				}
-				return b, resp.StatusCode, resp.Header, nil
-			}
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusTooManyRequests {
-				log.Printf("[upstream rate limited] model=%s exit=%s status=%d retry_after=%q body=%s", tryModel, currentSocks5ExitLabel(), resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
-				lastBody = errBody
-				lastStatus = resp.StatusCode
-				lastHeader = resp.Header.Clone()
-				lastErr = fmt.Errorf("upstream rate limited")
-				rotateSocks5OnRateLimit()
-				if attempt < attempts-1 {
-					continue
-				}
-			}
-			if debugMode {
-				log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
-			}
-			if resp.StatusCode >= 500 {
-				lastErr = fmt.Errorf("upstream error")
-				break
-			}
-			lastBody = errBody
-			lastStatus = resp.StatusCode
-			lastHeader = resp.Header.Clone()
-			lastErr = fmt.Errorf("upstream error")
-			return lastBody, lastStatus, lastHeader, lastErr
+	bodyMap["model"] = modelID
+	marshaled, _ := json.Marshal(bodyMap)
+	tryBody := marshaled
+	if upstream != nil {
+		switch upstream.APIType {
+		case UpstreamAnthropic:
+			tryBody = openAIToAnthropicRequest(marshaled)
+		case UpstreamResponses:
+			tryBody = openAIToResponsesRequest(marshaled, upstream)
 		}
 	}
-	return lastBody, lastStatus, lastHeader, lastErr
+	return tryBody, nil
 }
 
-func callOpenCodeAPIStream(upstreamBody []byte, modelID string) (io.ReadCloser, int, http.Header, error) {
-	initOCSession()
-	modelIDs := getModelIDs()
-	modelsToTry := []string{modelID}
-	for _, m := range modelIDs {
-		if m != modelID {
-			modelsToTry = append(modelsToTry, m)
+func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
+	if upstream == nil || upstream.BaseURL == "" {
+		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+
+	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
+	retryDelay := 1 * time.Second
+	proxyLabel := modelProxyLabel(proxyAddr)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+			return nil, 0, nil, ctx.Err()
+		default:
 		}
-	}
-	if len(modelsToTry) == 0 {
-		modelsToTry = []string{modelID}
-	}
-
-	var bodyMap map[string]any
-	if err := json.Unmarshal(upstreamBody, &bodyMap); err != nil {
-		return nil, 500, nil, fmt.Errorf("invalid request body")
-	}
-
-	for _, tryModel := range modelsToTry {
-		attempts := socks5RateLimitAttemptCount()
-		for attempt := 0; attempt < attempts; attempt++ {
-			up, err := buildOCRequest(tryModel, bodyMap)
-			if err != nil {
-				continue
+		up, err := buildUpstreamRequest(getUpstreamEndpoint(upstream), apiKey, preparedBody, upstream)
+		if err != nil {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, 0, nil, err
 			}
-			resp, err := getHTTPClient().Do(up)
-			if err != nil {
-				continue
+			// Refresh upstream config on build error too
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return resp.Body, resp.StatusCode, resp.Header, nil
+			upstreamName, upstream = newUpstreamName, newUpstream
+			apiKey, apiKeyIndex, apiKeys = selectUpstreamAPIKey(upstreamName, upstream)
+			retryDelay = 1 * time.Second
+			continue
+		}
+		var c *http.Client
+		c, proxyLabel = getModelHTTPClient(proxyAddr, false)
+		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+		startTTFB := time.Now()
+		resp, err := c.Do(up)
+		if err != nil {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, 0, nil, err
 			}
-			errBody, _ := io.ReadAll(resp.Body)
+			// Refresh upstream config on connection error too
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
+			}
+			upstreamName, upstream = newUpstreamName, newUpstream
+			apiKey, apiKeyIndex, apiKeys = selectUpstreamAPIKey(upstreamName, upstream)
+			retryDelay = 1 * time.Second
+			continue
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			ttfb := time.Since(startTTFB)
+			log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, ttfb.Round(time.Millisecond))
+			b, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusTooManyRequests {
-				log.Printf("[upstream rate limited] model=%s exit=%s status=%d retry_after=%q body=%s", tryModel, currentSocks5ExitLabel(), resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
-				rotateSocks5OnRateLimit()
-				if attempt < attempts-1 {
-					continue
+			if readErr != nil {
+				return nil, 0, nil, readErr
+			}
+			if len(rawResponse) > 0 && rawResponse[0] {
+				// rawResponse: skip conversion, return as-is
+			} else if upstream != nil && upstream.APIType == UpstreamResponses {
+				b = convertResponsesToChat(b, modelID)
+			} else if isAnthropicFormat(b) {
+				b = convertAnthropicToOpenAI(b, modelID)
+			}
+			return b, resp.StatusCode, resp.Header, nil
+		}
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if shouldRetryUpstreamStatus(resp.StatusCode) {
+			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			manyKeys := len(apiKeys) > 1
+			if manyKeys {
+				// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
+				apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
+			} else {
+				// 单 key：按指数退避，下一轮用更长的退避等待
+				if err := waitForRetry(ctx, retryDelay); err != nil {
+					return nil, 0, nil, err
 				}
 			}
-			if debugMode {
-				log.Printf("[upstream error] model=%s status=%d body=%s", tryModel, resp.StatusCode, string(errBody))
+			// Refresh upstream config: user may have re-mapped or deleted this upstream
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return errBody, resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
-			if resp.StatusCode >= 500 {
-				break
+			upstreamName, upstream = newUpstreamName, newUpstream
+			if manyKeys {
+				// 多 key：沿用 rotate 选定的 key，不重新按游标选（保留 429 切 key 的意图）
+				apiKeys = getUpstreamAPIKeys(upstream)
+			} else {
+				// 单 key：按指数退避，下一轮用更长的退避等待
+				apiKey, apiKeyIndex, apiKeys = selectUpstreamAPIKey(upstreamName, upstream)
+				retryDelay = nextRetryDelay(retryDelay)
 			}
-			// 返回错误体供下游透传
-			return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), nil
+			if manyKeys {
+				retryDelay = 1 * time.Second
+			}
+			continue
+		}
+		// Non-retryable error: return immediately
+		errBody = mapUpstreamErrorBody(errBody, upstream.APIType)
+		return errBody, resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream error: %s", string(errBody))
+	}
+}
+
+func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
+	tryBody, err := prepareOpenAIUpstreamBody(reqBody, modelID, upstream)
+	if err != nil {
+		return nil, 500, nil, err
+	}
+	return callPreparedUpstream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, rawResponse...)
+}
+
+func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
+	if upstream == nil || upstream.BaseURL == "" {
+		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+
+	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
+	retryDelay := 1 * time.Second
+	proxyLabel := modelProxyLabel(proxyAddr)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+			return nil, 0, nil, ctx.Err()
+		default:
+		}
+		up, err := buildUpstreamRequest(getUpstreamEndpoint(upstream), apiKey, preparedBody, upstream)
+		if err != nil {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, 0, nil, err
+			}
+			// Refresh upstream config on build error too
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
+			}
+			upstreamName, upstream = newUpstreamName, newUpstream
+			apiKey, apiKeyIndex, apiKeys = selectUpstreamAPIKey(upstreamName, upstream)
+			retryDelay = 1 * time.Second
+			continue
+		}
+		var c *http.Client
+		c, proxyLabel = getModelHTTPClient(proxyAddr, true)
+		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+		startTTFB := time.Now()
+		resp, err := c.Do(up)
+		if err != nil {
+			if err := waitForRetry(ctx, retryDelay); err != nil {
+				return nil, 0, nil, err
+			}
+			// Refresh upstream config on connection error too
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
+			}
+			upstreamName, upstream = newUpstreamName, newUpstream
+			apiKey, apiKeyIndex, apiKeys = selectUpstreamAPIKey(upstreamName, upstream)
+			retryDelay = 1 * time.Second
+			continue
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			wrappedBody := &ttfbReadCloser{
+				inner:      resp.Body,
+				start:      startTTFB,
+				upstream:   effectiveUpstreamName(upstreamName),
+				model:      modelID,
+				clientAPI:  clientAPI,
+				keySlot:    formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)),
+				proxyLabel: proxyLabel,
+			}
+			return wrappedBody, resp.StatusCode, resp.Header, nil
+		}
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if shouldRetryUpstreamStatus(resp.StatusCode) {
+			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			manyKeys := len(apiKeys) > 1
+			if manyKeys {
+				// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
+				apiKey, apiKeyIndex = rotateUpstreamAPIKey(apiKeys, apiKeyIndex)
+			} else {
+				// 单 key：按指数退避，下一轮用更长的退避等待
+				if err := waitForRetry(ctx, retryDelay); err != nil {
+					return nil, 0, nil, err
+				}
+			}
+			// Refresh upstream config: user may have re-mapped or deleted this upstream
+			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
+			if newUpstream == nil || newUpstream.BaseURL == "" {
+				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)
+			}
+			upstreamName, upstream = newUpstreamName, newUpstream
+			if manyKeys {
+				// 多 key：沿用 rotate 选定的 key，不重新按游标选（保留 429 切 key 的意图）
+				apiKeys = getUpstreamAPIKeys(upstream)
+			} else {
+				// 单 key：按指数退避，下一轮用更长的退避等待
+				apiKey, apiKeyIndex, apiKeys = selectUpstreamAPIKey(upstreamName, upstream)
+				retryDelay = nextRetryDelay(retryDelay)
+			}
+			if manyKeys {
+				retryDelay = 1 * time.Second
+			}
+			continue
+		}
+		// Non-retryable error: return immediately
+		errBody = mapUpstreamErrorBody(errBody, upstream.APIType)
+		return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream error")
+	}
+}
+
+func callUpstreamStream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
+	tryBody, err := prepareOpenAIUpstreamBody(reqBody, modelID, upstream)
+	if err != nil {
+		return nil, 500, nil, err
+	}
+	return callPreparedUpstreamStream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
+}
+
+func stripBillingHeaderText(s string) string {
+	return strings.TrimSpace(reBillingHeader.ReplaceAllString(s, ""))
+}
+
+func stripBillingHeaderFromResponsesItems(items any) {
+	arr, ok := items.([]any)
+	if !ok {
+		return
+	}
+	for _, item := range arr {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role != "system" && role != "developer" {
+			continue
+		}
+		switch content := msg["content"].(type) {
+		case string:
+			msg["content"] = stripBillingHeaderText(content)
+		case []any:
+			for _, part := range content {
+				pm, ok := part.(map[string]any)
+				if !ok {
+					continue
+				}
+				if text, ok := pm["text"].(string); ok {
+					pm["text"] = stripBillingHeaderText(text)
+				}
+			}
 		}
 	}
-	return nil, 500, nil, fmt.Errorf("all models failed")
+}
+
+func ensureResponsesIncludeUsage(req map[string]any) {
+	stream, _ := req["stream"].(bool)
+	if !stream {
+		return
+	}
+	if so, ok := req["stream_options"].(map[string]any); ok {
+		so["include_usage"] = true
+		req["stream_options"] = so
+		return
+	}
+	req["stream_options"] = map[string]any{"include_usage": true}
+}
+
+func prepareAnthropicPassthroughBody(body []byte, modelID string) ([]byte, error) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+	req["model"] = modelID
+	if err := normalizeRawMessagesToolCallArguments(req["messages"]); err != nil {
+		return nil, err
+	}
+	return json.Marshal(req)
+}
+
+func proxyAnthropicPassthroughStream(w http.ResponseWriter, body io.ReadCloser, model string) error {
+	defer body.Close()
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(body)
+	currentEvent := ""
+	var inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens float64
+	recordedUsage := false
+
+	updateAnthropicUsage := func(usage map[string]any) {
+		if usage == nil {
+			return
+		}
+		if v, ok := getFloat(usage, "input_tokens"); ok && v > 0 {
+			inputTokens = v
+		}
+		if v, ok := getFloat(usage, "cache_creation_input_tokens"); ok && v > 0 {
+			cacheCreationInputTokens = v
+		}
+		if v, ok := getFloat(usage, "cache_read_input_tokens"); ok && v > 0 {
+			cacheReadInputTokens = v
+		}
+		if v, ok := getFloat(usage, "output_tokens"); ok && v >= 0 {
+			outputTokens = v
+		}
+	}
+
+	recordAnthropicUsage := func() {
+		if recordedUsage {
+			return
+		}
+		promptTokens := inputTokens + cacheCreationInputTokens + cacheReadInputTokens
+		totalTokens := promptTokens + outputTokens
+		if totalTokens <= 0 {
+			return
+		}
+		recordedUsage = true
+		recordTokenUsage(model, int64(promptTokens), int64(outputTokens), int64(totalTokens))
+	}
+	defer func() {
+		// If the stream ended after message_delta but before message_stop, still
+		// keep the gateway stats consistent. Claude Code receives the raw stream;
+		// this only affects this gateway's admin stats.
+		if outputTokens > 0 {
+			recordAnthropicUsage()
+		}
+	}()
+
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			if _, writeErr := io.WriteString(w, line); writeErr != nil {
+				return writeErr
+			}
+			if strings.HasPrefix(line, "event:") {
+				currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			} else if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if data != "" && data != "[DONE]" {
+					var payload map[string]any
+					if json.Unmarshal([]byte(data), &payload) == nil {
+						switch currentEvent {
+						case "message_start":
+							if msg, ok := payload["message"].(map[string]any); ok {
+								if usage, ok := msg["usage"].(map[string]any); ok {
+									updateAnthropicUsage(usage)
+								}
+							}
+						case "message_delta":
+							if usage, ok := payload["usage"].(map[string]any); ok {
+								updateAnthropicUsage(usage)
+							}
+						case "message_stop":
+							recordAnthropicUsage()
+						}
+					}
+				}
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func prepareResponsesPassthroughBody(body []byte, modelID string, alias ModelAlias) ([]byte, error) {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, err
+	}
+	req["model"] = modelID
+	if err := normalizeRawMessagesToolCallArguments(req["messages"]); err != nil {
+		return nil, err
+	}
+	if instructions, ok := req["instructions"].(string); ok {
+		req["instructions"] = stripBillingHeaderText(instructions)
+	}
+	stripBillingHeaderFromResponsesItems(req["input"])
+	stripBillingHeaderFromResponsesItems(req["messages"])
+	ensureResponsesIncludeUsage(req)
+
+	return json.Marshal(req)
+}
+
+func proxyResponsesPassthroughStream(w http.ResponseWriter, body io.ReadCloser, model string) error {
+	defer body.Close()
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(body)
+	currentEvent := ""
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			if _, writeErr := io.WriteString(w, line); writeErr != nil {
+				return writeErr
+			}
+			if strings.HasPrefix(line, "event:") {
+				currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			} else if strings.HasPrefix(line, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+				if data != "" && data != "[DONE]" && (currentEvent == "response.completed" || currentEvent == "response.incomplete") {
+					var payload map[string]any
+					if json.Unmarshal([]byte(data), &payload) == nil {
+						if u := extractResponsesUsage(payload); u != nil {
+							recordUsageMap(model, u)
+						}
+					}
+				}
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func extractResponsesUsage(payload map[string]any) map[string]any {
+	if u, ok := payload["usage"].(map[string]any); ok {
+		return u
+	}
+	if resp, ok := payload["response"].(map[string]any); ok {
+		if u, ok := resp["usage"].(map[string]any); ok {
+			return u
+		}
+	}
+	return nil
+}
+
+func recordUsageMap(model string, u map[string]any) {
+	pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
+	ct, _ := getFloat(u, "completion_tokens", "output_tokens")
+	tt, _ := getFloat(u, "total_tokens")
+	if tt == 0 && pt+ct > 0 {
+		tt = pt + ct
+	}
+	if tt > 0 {
+		recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
+	}
+}
+
+func responsesUsageToChatUsage(u map[string]any) map[string]any {
+	if u == nil {
+		return nil
+	}
+	pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
+	ct, _ := getFloat(u, "completion_tokens", "output_tokens")
+	tt, _ := getFloat(u, "total_tokens")
+	if tt == 0 && pt+ct > 0 {
+		tt = pt + ct
+	}
+	return map[string]any{
+		"prompt_tokens":     int64(pt),
+		"completion_tokens": int64(ct),
+		"total_tokens":      int64(tt),
+	}
+}
+
+func responsesStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser, model string, recordUsage bool) {
+	defer respBody.Close()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(respBody)
+	chunkID := "chatcmpl-" + randomString(16)
+	created := time.Now().Unix()
+	currentEvent := ""
+	roleSent := false
+	doneSent := false
+	hasToolCalls := false
+	toolIndexes := map[string]int{}
+	nextToolIndex := 0
+
+	emit := func(delta map[string]any, finishReason any, usage map[string]any) {
+		if !roleSent {
+			chunk := map[string]any{
+				"id":      chunkID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
+			}
+			b, _ := json.Marshal(chunk)
+			w.Write([]byte("data: " + string(b) + "\n\n"))
+			roleSent = true
+		}
+		if delta == nil {
+			delta = map[string]any{}
+		}
+		chunk := map[string]any{
+			"id":      chunkID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finishReason}},
+		}
+		if usage != nil {
+			chunk["usage"] = usage
+		}
+		b, _ := json.Marshal(chunk)
+		w.Write([]byte("data: " + string(b) + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	// arguments.delta 事件可能用 item_id 回指，也可能用 call_id，
+	// 因此两个 key 都登记到同一个索引，避免同一个工具调用被拆成两个索引
+	getToolIndex := func(item map[string]any) int {
+		itemID, _ := item["id"].(string)
+		callID, _ := item["call_id"].(string)
+		if itemID != "" {
+			if idx, ok := toolIndexes[itemID]; ok {
+				return idx
+			}
+		}
+		if callID != "" {
+			if idx, ok := toolIndexes[callID]; ok {
+				return idx
+			}
+		}
+		idx := nextToolIndex
+		nextToolIndex++
+		if itemID != "" {
+			toolIndexes[itemID] = idx
+		}
+		if callID != "" {
+			toolIndexes[callID] = idx
+		}
+		if itemID == "" && callID == "" {
+			toolIndexes[fmt.Sprintf("tool_%d", idx)] = idx
+		}
+		return idx
+	}
+
+	for {
+		line, err := reader.ReadString('\n')
+		if line != "" {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "event:") {
+				currentEvent = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
+			} else if strings.HasPrefix(trimmed, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+				if data == "[DONE]" {
+					doneSent = true
+					break
+				}
+				if data != "" {
+					var payload map[string]any
+					if json.Unmarshal([]byte(data), &payload) == nil {
+						eventType, _ := payload["type"].(string)
+						if eventType == "" {
+							eventType = currentEvent
+						}
+						switch eventType {
+						case "response.output_text.delta":
+							if text, _ := payload["delta"].(string); text != "" {
+								emit(map[string]any{"content": text}, nil, nil)
+							}
+						case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+							if text, _ := payload["delta"].(string); text != "" {
+								emit(map[string]any{"reasoning_content": text}, nil, nil)
+							}
+						case "response.output_item.added":
+							if item, ok := payload["item"].(map[string]any); ok {
+								if typ, _ := item["type"].(string); typ == "function_call" {
+									idx := getToolIndex(item)
+									callID, _ := item["call_id"].(string)
+									if callID == "" {
+										callID, _ = item["id"].(string)
+									}
+									name, _ := item["name"].(string)
+									hasToolCalls = true
+									emit(map[string]any{"tool_calls": []map[string]any{{
+										"index": float64(idx),
+										"id":    callID,
+										"type":  "function",
+										"function": map[string]any{
+											"name":      name,
+											"arguments": "",
+										},
+									}}}, nil, nil)
+								}
+							}
+						case "response.function_call_arguments.delta":
+							itemID, _ := payload["item_id"].(string)
+							if itemID == "" {
+								itemID, _ = payload["call_id"].(string)
+							}
+							idx, ok := toolIndexes[itemID]
+							if !ok {
+								idx = nextToolIndex
+								toolIndexes[itemID] = idx
+								nextToolIndex++
+							}
+							if delta, _ := payload["delta"].(string); delta != "" {
+								emit(map[string]any{"tool_calls": []map[string]any{{
+									"index":    float64(idx),
+									"function": map[string]any{"arguments": delta},
+								}}}, nil, nil)
+							}
+						case "response.completed", "response.incomplete":
+							usage := responsesUsageToChatUsage(extractResponsesUsage(payload))
+							if recordUsage && usage != nil {
+								recordUsageMap(model, usage)
+							}
+							finishReason := "stop"
+							if hasToolCalls {
+								finishReason = "tool_calls"
+							}
+							if eventType == "response.incomplete" {
+								finishReason = "length"
+							}
+							emit(map[string]any{}, finishReason, usage)
+						}
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	if !doneSent {
+		w.Write([]byte("data: [DONE]\n\n"))
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 // ======================== 安全响应头过滤 ========================
@@ -1749,6 +3553,71 @@ func applyUpstreamErrorHeaders(w http.ResponseWriter, upstreamHeaders http.Heade
 	return status
 }
 
+// mapUpstreamErrorBody converts upstream error responses to standard OpenAI format
+func mapUpstreamErrorBody(body []byte, upstreamType UpstreamType) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(body)
+	if bytes.HasPrefix(trimmed, []byte("data:")) {
+		for _, line := range bytes.Split(trimmed, []byte{'\n'}) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+				continue
+			}
+			trimmed = payload
+			break
+		}
+	}
+	var parsed map[string]any
+	if json.Unmarshal(trimmed, &parsed) != nil {
+		return trimmed
+	}
+	// Already has OpenAI-format error
+	if errObj, ok := parsed["error"].(map[string]any); ok {
+		if _, hasMsg := errObj["message"]; hasMsg {
+			return trimmed
+		}
+	}
+	// Anthropic: { "error": { "type": "...", "message": "..." } }
+	if errObj, ok := parsed["error"].(map[string]any); ok {
+		if msg, ok := errObj["message"].(string); ok {
+			b, _ := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"message": msg,
+					"type":    errObj["type"],
+				},
+			})
+			return b
+		}
+	}
+	// Top-level message
+	if msg, ok := parsed["message"].(string); ok {
+		b, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": msg,
+				"type":    parsed["type"],
+				"code":    parsed["type"],
+			},
+		})
+		return b
+	}
+	// msg field
+	if msg, ok := parsed["msg"].(string); ok {
+		b, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": msg,
+			},
+		})
+		return b
+	}
+	return trimmed
+}
+
 // ======================== Chat Completions Handler ========================
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1773,31 +3642,48 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-	req.Model = resolveModel(req.Model)
+	resolvedModel, modelAliasInfo, upstreamName, upstream := resolveModel(req.Model)
+	if !isKnownAlias(req.Model) {
+		http.Error(w, `{"error":{"message":"model not found; only configured aliases are accepted","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		return
+	}
+	req.Model = resolvedModel
 	if req.Model == "" {
-		modelIDs := getModelIDs()
-		if len(modelIDs) > 0 {
-			req.Model = modelIDs[0]
-		} else {
-			req.Model = "deepseek-v4-flash-free"
-		}
+		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
+		return
 	}
 
-	// 多模态路由：检测到图片时转发到配置的上游
+	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
+	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
+	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
+	if modelAliasInfo.MultimodalModel != "" {
+		var useMM bool
+		if hasNewImageContent(req.Messages) {
+			useMM = true
+		} else {
+			req.Messages = stripImagesForTextModel(req.Messages)
+		}
+		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, req.Model, upstreamName, upstream, useMM)
+		req.Model = modelName
+		upstreamName = upName
+		upstream = up
+		modelAliasInfo.Socks5Proxy = proxy
+	}
 
 	req.Messages = fixToolCallGaps(req.Messages)
-	keepReasoning := wantsReasoning(&req)
-	req.Messages = ensureReasoningContent(req.Messages, keepReasoning)
-	if req.Stream {
-		if req.ExtraBody == nil {
-			req.ExtraBody = map[string]any{}
-		}
-		req.ExtraBody["stream_options"] = map[string]any{"include_usage": true}
+	var toolArgsErr error
+	req.Messages, toolArgsErr = normalizeMessagesToolCallArguments(req.Messages)
+	if toolArgsErr != nil {
+		log.Printf("[request invalid] path=/v1/chat/completions model=%q err=%v", req.Model, toolArgsErr)
+		http.Error(w, toolArgsErr.Error(), http.StatusBadRequest)
+		return
 	}
+	ensureReasoningEffort(&req, modelAliasInfo)
+	req.Messages = ensureReasoningContent(req.Messages)
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, upHeader, err := callOpenCodeAPIStream(upstreamBody, req.Model)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -1813,6 +3699,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer upResp.Close()
+		// 如果上游是 Anthropic，需要将 Anthropic SSE 流转为 OpenAI Chat SSE 格式
+		if upstream != nil && upstream.APIType == UpstreamAnthropic {
+			anthropicStreamToChatHandler(w, upResp, req.Model)
+			return
+		}
+		if upstream != nil && upstream.APIType == UpstreamResponses {
+			responsesStreamToChatHandler(w, upResp, req.Model, true)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -1846,7 +3741,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			out, usage := convertStreamChunkWithUsage(line, keepReasoning)
+			out, usage := convertStreamChunkWithUsage(line)
 			if out == "" {
 				// 空choices chunk，但可能有 usage
 				if usage != nil {
@@ -1871,7 +3766,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			w.Write([]byte(out))
-			w.Write([]byte("\n"))
+			w.Write([]byte("\n\n"))
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
@@ -1879,7 +3774,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, upHeader, err := callOpenCodeAPI(upstreamBody, req.Model)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -1892,17 +3787,20 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	outBody := respBody
-	convertedResp, err := convertResponse(respBody, keepReasoning)
+	convertedResp, err := convertResponse(respBody)
 	if err == nil {
 		outBody = convertedResp
 	}
 	// Record token usage
-	var usageResp map[string]any
-	if json.Unmarshal(respBody, &usageResp) == nil {
-		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
+	var usageResp2 map[string]any
+	if json.Unmarshal(respBody, &usageResp2) == nil {
+		if u, ok := usageResp2["usage"].(map[string]any); ok {
+			pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
+			ct, _ := getFloat(u, "completion_tokens", "output_tokens")
+			tt, _ := getFloat(u, "total_tokens")
+			if tt == 0 && pt+ct > 0 {
+				tt = pt + ct
+			}
 			if tt > 0 {
 				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
 			}
@@ -1920,50 +3818,17 @@ func listModelsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	modelMu.RLock()
-	loaded, models := modelsLoaded, modelsCache
-	modelMu.RUnlock()
-	if !loaded || len(models) == 0 {
-		fetched, err := fetchModels()
-		if err == nil && len(fetched) > 0 {
-			modelMu.Lock()
-			modelsCache = fetched
-			modelsLoaded = true
-			models = modelsCache
-			modelMu.Unlock()
-		}
-	}
-	if len(models) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "无法获取模型列表，请检查上游服务是否可用",
-		})
-		return
-	}
-	// 追加别名模型
-	configMu.RLock()
-	aliases := make([]string, 0, len(modelAlias))
-	for k := range modelAlias {
-		aliases = append(aliases, k)
-	}
-	configMu.RUnlock()
-	now := time.Now().Unix()
-	aliasModels := make([]ModelInfo, 0, len(aliases))
-	for _, alias := range aliases {
-		aliasModels = append(aliasModels, ModelInfo{ID: alias, Object: "model", Created: now, OwnedBy: "alias"})
-	}
-	allModels := append(models, aliasModels...)
+	models := getAliasModelInfos()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"object": "list",
-		"data":   allModels,
+		"data":   models,
 	})
 }
 
-// ======================== Claude Messages API ========================
+// ======================== Anthropic Messages API ========================
 
-func extractClaudeSystemText(system any) string {
+func extractAnthropicSystemText(system any) string {
 	if system == nil {
 		return ""
 	}
@@ -1988,7 +3853,7 @@ func extractClaudeSystemText(system any) string {
 	}
 }
 
-func cleanJsonSchema(schema any) any {
+func cleanJSONSchema(schema any) any {
 	m, ok := schema.(map[string]any)
 	if !ok {
 		return schema
@@ -2002,12 +3867,12 @@ func cleanJsonSchema(schema any) any {
 	}
 	for k, v := range m {
 		if sub, ok := v.(map[string]any); ok {
-			m[k] = cleanJsonSchema(sub)
+			m[k] = cleanJSONSchema(sub)
 		}
 		if arr, ok := v.([]any); ok {
 			for i, elem := range arr {
 				if sub, ok := elem.(map[string]any); ok {
-					arr[i] = cleanJsonSchema(sub)
+					arr[i] = cleanJSONSchema(sub)
 				}
 			}
 			m[k] = arr
@@ -2016,12 +3881,12 @@ func cleanJsonSchema(schema any) any {
 	return m
 }
 
-func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
+func anthropicToOpenAIMessages(anthropicMsgs []AnthropicMessage, system any) []Message {
 	var messages []Message
-	if sysText := extractClaudeSystemText(system); sysText != "" {
+	if sysText := extractAnthropicSystemText(system); sysText != "" {
 		messages = append(messages, Message{Role: "system", Content: sysText})
 	}
-	for _, msg := range claudeMsgs {
+	for _, msg := range anthropicMsgs {
 		switch content := msg.Content.(type) {
 		case string:
 			messages = append(messages, Message{Role: msg.Role, Content: content})
@@ -2161,27 +4026,113 @@ func claudeToOpenAIMessages(claudeMsgs []ClaudeMessage, system any) []Message {
 	return messages
 }
 
-func claudeToOpenAITools(claudeTools []ClaudeTool) []Tool {
-	tools := make([]Tool, 0, len(claudeTools))
-	for _, ct := range claudeTools {
+func anthropicToOpenAITools(anthropicTools []AnthropicTool) []Tool {
+	tools := make([]Tool, 0, len(anthropicTools))
+	for _, ct := range anthropicTools {
 		params := ct.InputSchema
 		if params == nil {
 			params = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
-		params = cleanJsonSchema(params)
+		params = cleanJSONSchema(params)
+		paramsMap, ok := params.(map[string]any)
+		if !ok {
+			// 非对象类型（如数组、字符串）的 input_schema 退化为空对象
+			paramsMap = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
 		tools = append(tools, Tool{
 			Type: "function",
 			Function: ToolFunction{
 				Name:        ct.Name,
 				Description: ct.Description,
-				Parameters:  params.(map[string]any),
+				Parameters:  paramsMap,
 			},
 		})
 	}
 	return tools
 }
 
-func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) []byte {
+func convertAnthropicToolChoice(choice any) any {
+	if choice == nil {
+		return nil
+	}
+	switch v := choice.(type) {
+	case string:
+		// Anthropic 也允许字符串，但标准是对象；直接透传
+		return v
+	case map[string]any:
+		t, _ := v["type"].(string)
+		switch t {
+		case "auto", "none":
+			return t
+		case "any":
+			// Anthropic any -> OpenAI required
+			return "required"
+		case "tool":
+			name, _ := v["name"].(string)
+			if name == "" {
+				return "auto"
+			}
+			return map[string]any{
+				"type":     "function",
+				"function": map[string]any{"name": name},
+			}
+		default:
+			return choice
+		}
+	default:
+		return choice
+	}
+}
+
+func buildAnthropicErrorBody(errorType, message string) []byte {
+	if strings.TrimSpace(errorType) == "" {
+		errorType = "api_error"
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "upstream error"
+	}
+	b, _ := json.Marshal(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    errorType,
+			"message": message,
+		},
+	})
+	return b
+}
+
+func upstreamErrorToAnthropic(errObj any, fallback string) (string, string) {
+	errType := "api_error"
+	msg := fallback
+	if m, ok := errObj.(map[string]any); ok {
+		if s, ok := m["type"].(string); ok && strings.TrimSpace(s) != "" {
+			errType = s
+		}
+		if s, ok := m["message"].(string); ok && strings.TrimSpace(s) != "" {
+			msg = s
+		}
+		if code, ok := m["code"]; ok && code != nil {
+			msg = fmt.Sprintf("%s (upstream code: %v)", msg, code)
+		}
+	} else if s, ok := errObj.(string); ok && strings.TrimSpace(s) != "" {
+		msg = s
+	}
+	if strings.TrimSpace(msg) == "" {
+		msg = "upstream error"
+	}
+	return errType, msg
+}
+
+func openAIToAnthropicResponse(chatBody []byte, model string) ([]byte, bool) {
+	var raw map[string]any
+	if err := json.Unmarshal(chatBody, &raw); err == nil {
+		if errObj, ok := raw["error"]; ok {
+			errType, msg := upstreamErrorToAnthropic(errObj, "upstream returned error")
+			log.Printf("Warning: upstream returned error object: type=%s message=%s", errType, msg)
+			return buildAnthropicErrorBody(errType, msg), false
+		}
+	}
+
 	var chat struct {
 		ID      string `json:"id"`
 		Model   string `json:"model"`
@@ -2190,6 +4141,7 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 			Message struct {
 				Content          string     `json:"content"`
 				ReasoningContent string     `json:"reasoning_content"`
+				Reasoning        string     `json:"reasoning"`
 				ToolCalls        []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
@@ -2197,72 +4149,82 @@ func openAIToClaudeResponse(chatBody []byte, model string, wantReasoning bool) [
 		Usage map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal(chatBody, &chat); err != nil {
-		log.Printf("Warning: openAIToClaudeResponse unmarshal failed: %v", err)
+		log.Printf("Warning: openAIToAnthropicResponse unmarshal failed: %v", err)
+		return buildAnthropicErrorBody("api_error", "upstream returned invalid JSON: "+err.Error()), false
+	}
+	if len(chat.Choices) == 0 {
+		preview := truncatePreview(string(chatBody), 500)
+		log.Printf("Warning: upstream returned chat completion without choices: %s", preview)
+		return buildAnthropicErrorBody("api_error", "upstream returned chat completion without choices"), false
 	}
 
-	content := []ClaudeContent{}
+	content := []AnthropicContent{}
 	stopReason := "end_turn"
 
-	if len(chat.Choices) > 0 {
-		msg := chat.Choices[0].Message
-		fr := chat.Choices[0].FinishReason
-		if wantReasoning && msg.ReasoningContent != "" {
-			content = append(content, ClaudeContent{
-				Type:     "thinking",
-				Thinking: msg.ReasoningContent,
-			})
+	msg := chat.Choices[0].Message
+	fr := chat.Choices[0].FinishReason
+	reasoning := msg.ReasoningContent
+	if reasoning == "" {
+		reasoning = msg.Reasoning
+	}
+	if reasoning != "" {
+		content = append(content, AnthropicContent{
+			Type:     "thinking",
+			Thinking: reasoning,
+		})
+	}
+	if msg.Content != "" {
+		content = append(content, AnthropicContent{
+			Type: "text",
+			Text: msg.Content,
+		})
+	}
+	for _, tc := range msg.ToolCalls {
+		var input any
+		json.Unmarshal([]byte(tc.Function.Arguments), &input)
+		if input == nil {
+			input = map[string]any{}
 		}
-		if msg.Content != "" {
-			content = append(content, ClaudeContent{
-				Type: "text",
-				Text: msg.Content,
-			})
-		}
-		for _, tc := range msg.ToolCalls {
-			var input any
-			json.Unmarshal([]byte(tc.Function.Arguments), &input)
-			if input == nil {
-				input = map[string]any{}
-			}
-			content = append(content, ClaudeContent{
-				Type:  "tool_use",
-				ID:    tc.ID,
-				Name:  tc.Function.Name,
-				Input: input,
-			})
-		}
-		switch fr {
-		case "stop":
-			stopReason = "end_turn"
-		case "length":
-			stopReason = "max_tokens"
-		case "tool_calls", "function_call":
-			stopReason = "tool_use"
-		}
+		content = append(content, AnthropicContent{
+			Type:  "tool_use",
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+	switch fr {
+	case "stop":
+		stopReason = "end_turn"
+	case "length":
+		stopReason = "max_tokens"
+	case "tool_calls", "function_call":
+		stopReason = "tool_use"
 	}
 
 	if len(content) == 0 {
-		content = append(content, ClaudeContent{Type: "text", Text: ""})
+		log.Printf("Warning: upstream returned empty assistant message for model %s", model)
+		return buildAnthropicErrorBody("api_error", "upstream returned empty assistant message"), false
 	}
 
-	resp := ClaudeResponse{
-		ID:         fmt.Sprintf("msg_%s", randomString(24)),
-		Type:       "message",
-		Role:       "assistant",
-		Content:    content,
-		Model:      model,
-		StopReason: stopReason,
+	resp := AnthropicResponse{
+		ID:           fmt.Sprintf("msg_%s", randomString(24)),
+		Type:         "message",
+		Role:         "assistant",
+		Content:      content,
+		Model:        model,
+		StopReason:   stopReason,
+		StopSequence: nil,
 	}
 	if chat.Usage != nil {
-		inputTokens, _ := chat.Usage["prompt_tokens"]
-		outputTokens, _ := chat.Usage["completion_tokens"]
-		resp.Usage = &ClaudeUsage{
+		inputTokens, _ := getFloat(chat.Usage, "input_tokens", "prompt_tokens")
+		outputTokens, _ := getFloat(chat.Usage, "output_tokens", "completion_tokens")
+		resp.Usage = &AnthropicUsage{
 			InputTokens:  int(toFloat64(inputTokens)),
 			OutputTokens: int(toFloat64(outputTokens)),
 		}
 	}
 	result, _ := json.Marshal(resp)
-	return result
+	return result, true
 }
 
 func toFloat64(v any) float64 {
@@ -2278,7 +4240,27 @@ func toFloat64(v any) float64 {
 	}
 }
 
-func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
+func getFloat(m map[string]any, keys ...string) (float64, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch n := v.(type) {
+			case float64:
+				return n, true
+			case float32:
+				return float64(n), true
+			case int:
+				return float64(n), true
+			case int64:
+				return float64(n), true
+			case int32:
+				return float64(n), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -2295,50 +4277,154 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[request #%d] POST /v1/messages\n%s", cnt, string(body))
 	}
 
-	var claudeReq ClaudeRequest
-	if err := json.Unmarshal(body, &claudeReq); err != nil {
+	var anthropicReq AnthropicRequest
+	if err := json.Unmarshal(body, &anthropicReq); err != nil {
 		http.Error(w, `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON"}}`, http.StatusBadRequest)
 		return
 	}
-	claudeReq.Model = resolveModel(claudeReq.Model)
+	resolvedModel, modelAliasInfo, upstreamName, upstream := resolveModel(anthropicReq.Model)
+	if !isKnownAlias(anthropicReq.Model) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": "model not found; only configured aliases are accepted"}})
+		return
+	}
+	anthropicReq.Model = resolvedModel
 
-	// 多模态路由
+	// 上游是 Anthropic 类型时，下游入口与上游同为 Anthropic 协议，直接透传
+	if upstream != nil && upstream.APIType == UpstreamAnthropic {
+		rawBody, err := prepareAnthropicPassthroughBody(body, anthropicReq.Model)
+		if err != nil {
+			log.Printf("[request invalid] path=/v1/messages mode=passthrough model=%q err=%v", anthropicReq.Model, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": err.Error()}})
+			return
+		}
+		if anthropicReq.Stream {
+			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
+			if err != nil || status < 200 || status >= 300 {
+				errResp := map[string]any{
+					"type":  "error",
+					"error": map[string]string{"type": "api_error", "message": "upstream error"},
+				}
+				w.Header().Set("Content-Type", "application/json")
+				status = applyUpstreamErrorHeaders(w, upHeader, status)
+				w.WriteHeader(status)
+				if upResp != nil {
+					errBody, _ := io.ReadAll(upResp)
+					if len(errBody) > 0 {
+						w.Write(errBody)
+						return
+					}
+				}
+				json.NewEncoder(w).Encode(errResp)
+				return
+			}
+			defer upResp.Close()
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+			if err := proxyAnthropicPassthroughStream(w, upResp, anthropicReq.Model); err != nil && debugMode {
+				log.Printf("[anthropic raw stream passthrough error] %v", err)
+			}
+			return
+		}
 
-	messages := claudeToOpenAIMessages(claudeReq.Messages, claudeReq.System)
+		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, true)
+		if err != nil || status < 200 || status >= 300 {
+			w.Header().Set("Content-Type", "application/json")
+			status = applyUpstreamErrorHeaders(w, upHeader, status)
+			w.WriteHeader(status)
+			if len(respBody) > 0 {
+				w.Write(respBody)
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": "upstream error"}})
+			}
+			return
+		}
+		// Record token usage
+		var usageResp map[string]any
+		if json.Unmarshal(respBody, &usageResp) == nil {
+			if u, ok := usageResp["usage"].(map[string]any); ok {
+				it, _ := u["input_tokens"].(float64)
+				ot, _ := u["output_tokens"].(float64)
+				tt := it + ot
+				if tt > 0 {
+					recordTokenUsage(anthropicReq.Model, int64(it), int64(ot), int64(tt))
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if debugMode {
+			log.Printf("[client response] (Anthropic passthrough)\n%s", string(respBody))
+		}
+		w.Write(respBody)
+		return
+	}
+
+	// 上游非 Anthropic 类型，走 Chat 中间格式转换
+
+	messages := anthropicToOpenAIMessages(anthropicReq.Messages, anthropicReq.System)
+	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
+	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
+	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
+	if modelAliasInfo.MultimodalModel != "" {
+		var useMM bool
+		if hasNewImageContent(messages) {
+			useMM = true
+		} else {
+			messages = stripImagesForTextModel(messages)
+		}
+		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, anthropicReq.Model, upstreamName, upstream, useMM)
+		anthropicReq.Model = modelName
+		upstreamName = upName
+		upstream = up
+		modelAliasInfo.Socks5Proxy = proxy
+	}
 	messages = fixToolCallGaps(messages)
+	var toolArgsErr error
+	messages, toolArgsErr = normalizeMessagesToolCallArguments(messages)
+	if toolArgsErr != nil {
+		log.Printf("[request invalid] path=/v1/messages model=%q err=%v", anthropicReq.Model, toolArgsErr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": toolArgsErr.Error()}})
+		return
+	}
 
 	chatReq := OpenAIRequest{
-		Model:    claudeReq.Model,
+		Model:    anthropicReq.Model,
 		Messages: messages,
-		Stream:   claudeReq.Stream,
-		Thinking: claudeReq.Thinking,
+		Stream:   anthropicReq.Stream,
+		Thinking: anthropicReq.Thinking,
 	}
-	if claudeReq.Stream {
-		chatReq.ExtraBody = map[string]any{
-			"stream_options": map[string]any{"include_usage": true},
-		}
+	if anthropicReq.MaxTokens > 0 {
+		chatReq.MaxTokens = anthropicReq.MaxTokens
 	}
-	if claudeReq.MaxTokens > 0 {
-		chatReq.MaxTokens = claudeReq.MaxTokens
+	if anthropicReq.Temperature != nil {
+		chatReq.Temperature = anthropicReq.Temperature
 	}
-	if claudeReq.Temperature != nil {
-		chatReq.Temperature = claudeReq.Temperature
+	if anthropicReq.TopP != nil {
+		chatReq.TopP = anthropicReq.TopP
 	}
-	if claudeReq.TopP != nil {
-		chatReq.TopP = claudeReq.TopP
+	if len(anthropicReq.Tools) > 0 {
+		chatReq.Tools = anthropicToOpenAITools(anthropicReq.Tools)
 	}
-	if len(claudeReq.Tools) > 0 {
-		chatReq.Tools = claudeToOpenAITools(claudeReq.Tools)
+	if anthropicReq.ToolChoice != nil {
+		chatReq.ToolChoice = convertAnthropicToolChoice(anthropicReq.ToolChoice)
+	} else if len(chatReq.Tools) > 0 {
 		chatReq.ToolChoice = "auto"
 	}
 
-	keepReasoning := wantsReasoning(&chatReq)
-	chatReq.Messages = ensureReasoningContent(chatReq.Messages, keepReasoning)
-
+	ensureReasoningEffort(&chatReq, modelAliasInfo)
+	chatReq.Messages = ensureReasoningContent(chatReq.Messages)
 	upstreamBody := buildUpstreamBody(&chatReq)
 
-	if claudeReq.Stream {
-		upResp, status, upHeader, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model)
+	if anthropicReq.Stream {
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -2351,11 +4437,28 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer upResp.Close()
-		claudeStreamHandler(w, upResp, claudeReq.Model, keepReasoning)
+		// 注：Anthropic 上游已在上方同协议直通处理，此处不会到达。
+		// Responses 上游：先转为 Chat SSE 流，再转为 Anthropic SSE 流
+		if upstream != nil && upstream.APIType == UpstreamResponses {
+			pr2, pw2 := io.Pipe()
+			go func() {
+				defer pw2.Close()
+				chatW2 := &pipeResponseWriter{w: pw2}
+				// The outer anthropicStreamHandler records the converted usage.
+				// Avoid double-counting gateway stats for Responses -> Anthropic.
+				responsesStreamToChatHandler(chatW2, upResp, anthropicReq.Model, false)
+			}()
+			// 传 pr2 本体（不是 NopCloser）：anthropicStreamHandler 退出时关闭读端，
+			// 让阻塞在 pw2.Write 的 goroutine 立刻收到 ErrClosedPipe 退出
+			anthropicStreamHandler(w, pr2, anthropicReq.Model)
+		} else {
+			// OpenAI 上游：Chat SSE 流直接转为 Anthropic SSE 流
+			anthropicStreamHandler(w, upResp, anthropicReq.Model)
+		}
 		return
 	}
 
-	respBody, status, upHeader, err := callOpenCodeAPI(upstreamBody, chatReq.Model)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -2368,17 +4471,23 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claudeRespBody := openAIToClaudeResponse(respBody, claudeReq.Model, keepReasoning)
+	anthropicRespBody, convertedOK := openAIToAnthropicResponse(respBody, anthropicReq.Model)
+	if !convertedOK {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write(anthropicRespBody)
+		return
+	}
 
 	// Record token usage
-	var usageResp map[string]any
-	if json.Unmarshal(respBody, &usageResp) == nil {
-		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
+	var usageResp2 map[string]any
+	if json.Unmarshal(respBody, &usageResp2) == nil {
+		if u, ok := usageResp2["usage"].(map[string]any); ok {
+			pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
+			ct, _ := getFloat(u, "completion_tokens", "output_tokens")
+			tt, _ := getFloat(u, "total_tokens")
 			if tt > 0 {
-				recordTokenUsage(claudeReq.Model, int64(pt), int64(ct), int64(tt))
+				recordTokenUsage(anthropicReq.Model, int64(pt), int64(ct), int64(tt))
 			}
 		}
 	}
@@ -2386,12 +4495,14 @@ func claudeMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if debugMode {
-		log.Printf("[client response]\n%s", string(claudeRespBody))
+		log.Printf("[client response]\n%s", string(anthropicRespBody))
 	}
-	w.Write(claudeRespBody)
+	w.Write(anthropicRespBody)
 }
 
-func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model string, keepReasoning bool) {
+func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model string) {
+	// 必须关闭：作为 pipe 读端时，提前 return 会让写端 goroutine 永久阻塞
+	defer respBody.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -2401,12 +4512,19 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 	reader := bufio.NewReader(respBody)
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
+	// blockIndex 是下一个可用的块序号；每个已开启的块都要记住自己拿到的真实序号，
+	// 不能用 blockIndex-1 反推——否则块交错时 delta/stop 会打到别的块上。
 	blockIndex := 0
 	thinkingBlockOpen := false
 	textBlockOpen := false
+	thinkingBlockIndex := -1
+	textBlockIndex := -1
 	toolCallAccumulator := map[int]map[string]string{}
+	toolBlockIndex := map[int]int{}
 	toolCallOrder := []int{}
 	messageStartSent := false
+	finishSeen := false
+	finalStopReason := "end_turn"
 	fullUsage := map[string]any{}
 	defer func() {
 		if len(fullUsage) > 0 {
@@ -2419,10 +4537,10 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		}
 	}()
 
-	emitClaudeEvent := func(event string, data any) {
+	emitAnthropicEvent := func(event string, data any) {
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			log.Printf("Error marshaling Claude SSE event: %v", err)
+			log.Printf("Error marshaling Anthropic SSE event: %v", err)
 			return
 		}
 		w.Write([]byte("event: " + event + "\n"))
@@ -2436,9 +4554,9 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if !thinkingBlockOpen {
 			return
 		}
-		emitClaudeEvent("content_block_stop", map[string]any{
+		emitAnthropicEvent("content_block_stop", map[string]any{
 			"type":          "content_block_stop",
-			"index":         blockIndex - 1,
+			"index":         thinkingBlockIndex,
 			"content_block": map[string]any{"type": "thinking"},
 		})
 		thinkingBlockOpen = false
@@ -2448,9 +4566,9 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if !textBlockOpen {
 			return
 		}
-		emitClaudeEvent("content_block_stop", map[string]any{
+		emitAnthropicEvent("content_block_stop", map[string]any{
 			"type":          "content_block_stop",
-			"index":         blockIndex - 1,
+			"index":         textBlockIndex,
 			"content_block": map[string]any{"type": "text"},
 		})
 		textBlockOpen = false
@@ -2481,6 +4599,17 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 		if err := json.Unmarshal([]byte(line[6:]), &chunk); err != nil {
 			continue
 		}
+		if errObj, ok := chunk["error"]; ok {
+			errType, msg := upstreamErrorToAnthropic(errObj, "upstream stream returned error")
+			emitAnthropicEvent("error", map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"type":    errType,
+					"message": msg,
+				},
+			})
+			return
+		}
 
 		choices, ok := chunk["choices"].([]any)
 		if !ok || len(choices) == 0 {
@@ -2489,37 +4618,36 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			}
 			continue
 		}
-		if usageMap, ok := chunk["usage"].(map[string]any); ok && len(usageMap) > 0 {
-			fullUsage = usageMap
-		}
 
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
+		normalizeReasoningContent(delta)
 		finishReason, _ := choice["finish_reason"].(string)
 
 		if !messageStartSent {
 			messageStartSent = true
-			emitClaudeEvent("message_start", map[string]any{
+			emitAnthropicEvent("message_start", map[string]any{
 				"type": "message_start",
 				"message": map[string]any{
-					"id":          msgID,
-					"type":        "message",
-					"role":        "assistant",
-					"content":     []any{},
-					"model":       model,
-					"stop_reason": nil,
-					"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0},
+					"id":            msgID,
+					"type":          "message",
+					"role":          "assistant",
+					"content":       []any{},
+					"model":         model,
+					"stop_reason":   nil,
+					"stop_sequence": nil,
+					"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 				},
 			})
-			emitClaudeEvent("ping", map[string]any{"type": "ping"})
+			emitAnthropicEvent("ping", map[string]any{"type": "ping"})
 		}
 
-		if rc, ok := delta["reasoning_content"]; ok && keepReasoning {
+		if rc, ok := delta["reasoning_content"]; ok {
 			rcStr, _ := rc.(string)
 			if rcStr != "" {
 				closeTextBlock()
 				if !thinkingBlockOpen {
-					emitClaudeEvent("content_block_start", map[string]any{
+					emitAnthropicEvent("content_block_start", map[string]any{
 						"type":  "content_block_start",
 						"index": blockIndex,
 						"content_block": map[string]any{
@@ -2528,11 +4656,12 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 						},
 					})
 					thinkingBlockOpen = true
+					thinkingBlockIndex = blockIndex
 					blockIndex++
 				}
-				emitClaudeEvent("content_block_delta", map[string]any{
+				emitAnthropicEvent("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
-					"index": blockIndex - 1,
+					"index": thinkingBlockIndex,
 					"delta": map[string]any{
 						"type":     "thinking_delta",
 						"thinking": rcStr,
@@ -2546,7 +4675,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 			if contentStr != "" {
 				closeThinkingBlock()
 				if !textBlockOpen {
-					emitClaudeEvent("content_block_start", map[string]any{
+					emitAnthropicEvent("content_block_start", map[string]any{
 						"type":  "content_block_start",
 						"index": blockIndex,
 						"content_block": map[string]any{
@@ -2555,11 +4684,12 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 						},
 					})
 					textBlockOpen = true
+					textBlockIndex = blockIndex
 					blockIndex++
 				}
-				emitClaudeEvent("content_block_delta", map[string]any{
+				emitAnthropicEvent("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
-					"index": blockIndex - 1,
+					"index": textBlockIndex,
 					"delta": map[string]any{
 						"type": "text_delta",
 						"text": contentStr,
@@ -2593,7 +4723,7 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 						"args": "",
 					}
 					toolCallOrder = append(toolCallOrder, upstreamIndex)
-					emitClaudeEvent("content_block_start", map[string]any{
+					emitAnthropicEvent("content_block_start", map[string]any{
 						"type":  "content_block_start",
 						"index": blockIndex,
 						"content_block": map[string]any{
@@ -2603,15 +4733,16 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 							"input": map[string]any{},
 						},
 					})
+					toolBlockIndex[upstreamIndex] = blockIndex
 					blockIndex++
 				}
 
 				fn, _ := tc["function"].(map[string]any)
 				if argDelta, ok := fn["arguments"].(string); ok && argDelta != "" {
 					toolCallAccumulator[upstreamIndex]["args"] += argDelta
-					emitClaudeEvent("content_block_delta", map[string]any{
+					emitAnthropicEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
-						"index": blockIndex - 1,
+						"index": toolBlockIndex[upstreamIndex],
 						"delta": map[string]any{
 							"type":         "input_json_delta",
 							"partial_json": argDelta,
@@ -2631,9 +4762,9 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 
 			for _, idx := range toolCallOrder {
 				acc := toolCallAccumulator[idx]
-				emitClaudeEvent("content_block_stop", map[string]any{
+				emitAnthropicEvent("content_block_stop", map[string]any{
 					"type":  "content_block_stop",
-					"index": blockIndex - len(toolCallOrder) + indexOfInt(toolCallOrder, idx),
+					"index": toolBlockIndex[idx],
 					"content_block": map[string]any{
 						"type":  "tool_use",
 						"id":    acc["id"],
@@ -2642,60 +4773,430 @@ func claudeStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model st
 					},
 				})
 			}
+			// 已收尾的工具块不再重复 stop（上游异常多发 finish_reason 时会重复）
+			toolCallOrder = nil
 
-			stopReason := "end_turn"
 			switch finishReason {
 			case "length":
-				stopReason = "max_tokens"
+				finalStopReason = "max_tokens"
 			case "tool_calls", "function_call":
-				stopReason = "tool_use"
+				finalStopReason = "tool_use"
+			default:
+				finalStopReason = "end_turn"
 			}
-
-			usage := map[string]any{}
-			if len(fullUsage) > 0 {
-				usage["input_tokens"] = fullUsage["prompt_tokens"]
-				usage["output_tokens"] = fullUsage["completion_tokens"]
-			} else {
-				usage["input_tokens"] = 0
-				usage["output_tokens"] = 0
-			}
-
-			emitClaudeEvent("message_delta", map[string]any{
-				"type": "message_delta",
-				"delta": map[string]any{
-					"stop_reason": stopReason,
-				},
-				"usage": map[string]any{
-					"output_tokens": usage["output_tokens"],
-				},
-			})
-			emitClaudeEvent("message_stop", map[string]any{
-				"type": "message_stop",
-			})
-			return
+			finishSeen = true
+			// continue reading remaining chunks (usage chunk arrives after finish_reason)
 		}
 	}
-
 	closeThinkingBlock()
 	closeTextBlock()
-	emitClaudeEvent("message_delta", map[string]any{
-		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": "end_turn"},
-		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+	if !messageStartSent {
+		emitAnthropicEvent("error", map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "api_error",
+				"message": "upstream stream ended without message_start",
+			},
+		})
+		return
+	}
+
+	inputTokens := 0
+	if v, ok := fullUsage["prompt_tokens"]; ok {
+		inputTokens = int(toFloat64(v))
+	}
+	outputTokens := 0
+	if v, ok := fullUsage["completion_tokens"]; ok {
+		outputTokens = int(toFloat64(v))
+	}
+
+	if !finishSeen {
+		finalStopReason = "end_turn"
+	}
+
+	emitAnthropicEvent("message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   finalStopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]any{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+		},
 	})
-	emitClaudeEvent("message_stop", map[string]any{"type": "message_stop"})
+	emitAnthropicEvent("message_stop", map[string]any{"type": "message_stop"})
 }
 
-func indexOfInt(slice []int, val int) int {
-	for i, v := range slice {
-		if v == val {
-			return i
+// ======================== Anthropic 流式转换 ========================
+
+// pipeResponseWriter 适配 io.Writer 到 http.ResponseWriter 接口
+type pipeResponseWriter struct {
+	w      io.Writer
+	header http.Header
+}
+
+func (p *pipeResponseWriter) Header() http.Header {
+	if p.header == nil {
+		p.header = make(http.Header)
+	}
+	return p.header
+}
+
+func (p *pipeResponseWriter) Write(data []byte) (int, error) {
+	return p.w.Write(data)
+}
+
+func (p *pipeResponseWriter) WriteHeader(code int) {}
+
+func (p *pipeResponseWriter) Flush() {
+	// no-op for pipe; writes are synchronous
+}
+
+// anthropicStreamToChatHandler 将上游 Anthropic SSE 流实时转为 OpenAI Chat SSE 格式并写入客户端
+func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser, model string) {
+	// 同 anthropicStreamHandler：作为 pipe 读端时必须关闭，否则写端 goroutine 泄漏
+	defer respBody.Close()
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	reader := bufio.NewReader(respBody)
+
+	chunkID := "chatcmpl-" + randomString(16)
+	created := time.Now().Unix()
+	roleSent := false
+	toolCallAccumulator := map[int]map[string]string{}
+	fullUsage := map[string]any{}
+
+	defer func() {
+		if len(fullUsage) > 0 {
+			pt, _ := fullUsage["input_tokens"].(float64)
+			ct, _ := fullUsage["output_tokens"].(float64)
+			if pt > 0 || ct > 0 {
+				recordTokenUsage(model, int64(pt), int64(ct), int64(pt+ct))
+			}
+		}
+	}()
+
+	emitChatChunk := func(delta map[string]any, finishReason any, usage map[string]any) {
+		// 清理空 content，避免客户端收到 content:"" 的 chunk
+		if c, ok := delta["content"].(string); ok && c == "" {
+			delete(delta, "content")
+		}
+		if finishReason == nil || finishReason == "" {
+			finishReason = nil
+		}
+		chunk := map[string]any{
+			"id":      chunkID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index":         0,
+					"delta":         delta,
+					"finish_reason": finishReason,
+				},
+			},
+		}
+		if usage != nil {
+			chunk["usage"] = usage
+		}
+		jsonData, _ := json.Marshal(chunk)
+		w.Write([]byte("data: " + string(jsonData) + "\n\n"))
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
-	return 0
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("Error reading Anthropic stream: %v", err)
+			break
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if trimmed == "data: [DONE]" || trimmed == "[DONE]" {
+			break
+		}
+
+		// Parse Anthropic SSE data lines
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		var event map[string]any
+		if json.Unmarshal([]byte(line[6:]), &event) != nil {
+			continue
+		}
+
+		eventType, _ := event["type"].(string)
+
+		switch eventType {
+		case "message_start":
+			if msg, ok := event["message"].(map[string]any); ok {
+				if id, ok := msg["id"].(string); ok && id != "" {
+					chunkID = "chatcmpl-" + id
+				}
+				if u, ok := msg["usage"].(map[string]any); ok {
+					fullUsage = u
+				}
+			}
+			if !roleSent {
+				emitChatChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+				roleSent = true
+			}
+
+		case "content_block_start":
+			block, _ := event["content_block"].(map[string]any)
+			if block != nil {
+				blockType, _ := block["type"].(string)
+				switch blockType {
+				case "tool_use":
+					idx := len(toolCallAccumulator)
+					callID, _ := block["id"].(string)
+					name, _ := block["name"].(string)
+					toolCallAccumulator[idx] = map[string]string{
+						"id":   callID,
+						"name": name,
+						"args": "",
+					}
+					if !roleSent {
+						emitChatChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+						roleSent = true
+					}
+					delta := map[string]any{
+						"tool_calls": []map[string]any{
+							{
+								"index": float64(idx),
+								"id":    callID,
+								"type":  "function",
+								"function": map[string]any{
+									"name":      name,
+									"arguments": "",
+								},
+							},
+						},
+					}
+					emitChatChunk(delta, nil, nil)
+				}
+			}
+
+		case "content_block_delta":
+			deltaObj, _ := event["delta"].(map[string]any)
+			if deltaObj == nil {
+				continue
+			}
+			deltaType, _ := deltaObj["type"].(string)
+			switch deltaType {
+			case "thinking_delta":
+				thinking, _ := deltaObj["thinking"].(string)
+				if thinking != "" {
+					if !roleSent {
+						emitChatChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+						roleSent = true
+					}
+					emitChatChunk(map[string]any{"reasoning_content": thinking}, nil, nil)
+				}
+			case "text_delta":
+				text, _ := deltaObj["text"].(string)
+				if text != "" {
+					if !roleSent {
+						emitChatChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+						roleSent = true
+					}
+					emitChatChunk(map[string]any{"content": text}, nil, nil)
+				}
+			case "input_json_delta":
+				partialJSON, _ := deltaObj["partial_json"].(string)
+				index, _ := event["index"].(float64)
+				idx := int(index)
+				if tc, ok := toolCallAccumulator[idx]; ok {
+					tc["args"] += partialJSON
+					delta := map[string]any{
+						"tool_calls": []map[string]any{
+							{
+								"index":    float64(idx),
+								"function": map[string]any{"arguments": partialJSON},
+							},
+						},
+					}
+					emitChatChunk(delta, nil, nil)
+				}
+			}
+
+		case "message_delta":
+			deltaObj, _ := event["delta"].(map[string]any)
+			if deltaObj != nil {
+				stopReason, _ := deltaObj["stop_reason"].(string)
+				finishReason := ""
+				switch stopReason {
+				case "end_turn":
+					finishReason = "stop"
+				case "max_tokens":
+					finishReason = "length"
+				case "tool_use":
+					finishReason = "tool_calls"
+				default:
+					if stopReason != "" {
+						finishReason = stopReason
+					}
+				}
+				usage, _ := event["usage"].(map[string]any)
+				if usage != nil {
+					if ot, ok := usage["output_tokens"].(float64); ok {
+						fullUsage["output_tokens"] = ot
+					}
+				}
+				chatUsage := map[string]any{}
+				if pt, ok := fullUsage["input_tokens"].(float64); ok {
+					chatUsage["prompt_tokens"] = int64(pt)
+				}
+				if ot, ok := fullUsage["output_tokens"].(float64); ok {
+					chatUsage["completion_tokens"] = int64(ot)
+				}
+				if _, ok := chatUsage["prompt_tokens"]; !ok {
+					if u, ok2 := event["usage"].(map[string]any); ok2 {
+						if it, ok3 := u["input_tokens"].(float64); ok3 {
+							chatUsage["prompt_tokens"] = int64(it)
+							fullUsage["input_tokens"] = it
+						}
+					}
+				}
+				if _, ok := chatUsage["completion_tokens"]; !ok {
+					if u, ok2 := event["usage"].(map[string]any); ok2 {
+						if ot, ok3 := u["output_tokens"].(float64); ok3 {
+							chatUsage["completion_tokens"] = int64(ot)
+							fullUsage["output_tokens"] = ot
+						}
+					}
+				}
+				pt := float64(0)
+				if v, ok := chatUsage["prompt_tokens"].(int64); ok {
+					pt = float64(v)
+				}
+				ct := float64(0)
+				if v, ok := chatUsage["completion_tokens"].(int64); ok {
+					ct = float64(v)
+				}
+				chatUsage["total_tokens"] = int64(pt + ct)
+				if !roleSent {
+					emitChatChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+					roleSent = true
+				}
+				emitChatChunk(map[string]any{}, finishReason, chatUsage)
+			}
+
+		case "message_stop":
+			// nothing extra
+		case "ping":
+			// ignore
+		}
+	}
+
+	w.Write([]byte("data: [DONE]\n\n"))
+	if flusher != nil {
+		flusher.Flush()
+	}
 }
 
 // ======================== Responses API ========================
+
+// contentHasImage 检查单个消息的 content 是否包含图片 part。
+// 兼容 OpenAI（image_url）、Responses（input_image）、Claude（image）三种类型。
+func contentHasImage(content any) bool {
+	arr, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range arr {
+		if block, ok := item.(map[string]any); ok {
+			switch block["type"] {
+			case "image_url", "input_image", "image":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasNewImageContent 只检测"本轮"是否新增了图片，用于多模态路由判定。
+// codex 每轮请求都携带完整历史，历史图片不应影响本轮路由。
+// 判定策略（已用 codex 真实请求结构验证）：
+//
+//	① 最后一个 user 消息自身 content 含图 → 本轮新增图片（最常见）
+//	② 最后一个 user 消息紧邻的前 1 条是 tool 输出且含图 → 本轮 view_image 场景
+//
+// 其余情况（包括历史图片）都不视为本轮新增，返回 false。
+func hasNewImageContent(messages []Message) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			if contentHasImage(messages[i].Content) {
+				return true
+			}
+			if i-1 >= 0 && messages[i-1].Role == "tool" &&
+				contentHasImage(messages[i-1].Content) {
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
+// stripImagesForTextModel 路由到纯文本模型（无多模态模型）时调用：
+// 把请求中所有图片 part 替换为文本占位，避免纯文本模型上游报错。
+// 因为 codex 每轮携带全量历史，历史图片也必须一并剥离。
+func stripImagesForTextModel(messages []Message) []Message {
+	for i := range messages {
+		parts, ok := messages[i].Content.([]any)
+		if !ok {
+			continue
+		}
+		changed := false
+		cleaned := make([]any, 0, len(parts))
+		for _, p := range parts {
+			block, ok := p.(map[string]any)
+			if !ok {
+				// 裸字符串元素：包成 text block（content 数组规范要求元素为对象，
+				// 混合数组 [字符串, 图片] 剥离后残留的裸字符串会导致上游报
+				// "invalid type: string, expected ...ContentBlock"）
+				if s, ok := p.(string); ok {
+					cleaned = append(cleaned, map[string]any{"type": "text", "text": s})
+					changed = true
+				} else {
+					cleaned = append(cleaned, p)
+				}
+				continue
+			}
+			switch block["type"] {
+			case "image_url", "input_image", "image":
+				// 图片 → 文本占位（文本模型不认图，但认得上下文说明）
+				cleaned = append(cleaned, map[string]any{
+					"type": "text",
+					"text": "[图片已省略]",
+				})
+				changed = true
+			default:
+				cleaned = append(cleaned, p)
+			}
+		}
+		if changed {
+			messages[i].Content = cleaned
+		}
+	}
+	return messages
+}
 
 func responsesInputToMessages(input any, instructions string) []Message {
 	var messages []Message
@@ -2707,6 +5208,16 @@ func responsesInputToMessages(input any, instructions string) []Message {
 		messages = append(messages, Message{Role: "user", Content: v})
 	case []any:
 		var pendingAssistant *Message
+		// pendingOutputs 缓存当前 assistant turn 的工具输出（方案A：不立即 flush，
+		// 等同一 turn 的所有 function_call 聚合完成后统一输出，避免拆分出无
+		// reasoning_content 的 assistant 消息导致 DeepSeek thinking 模式拒绝）。
+		var pendingOutputs []struct {
+			CallID string
+			Output any
+		}
+		// pendingImages 暂存从 tool 输出提取的图片 part（mimo 等上游不接受
+		// tool 消息携带 image_url）。等下一个 user 消息时附加进去。
+		var pendingImages []map[string]any
 		ensurePendingAssistant := func() *Message {
 			if pendingAssistant == nil {
 				pendingAssistant = &Message{Role: "assistant", Content: ""}
@@ -2722,6 +5233,30 @@ func responsesInputToMessages(input any, instructions string) []Message {
 			}
 			messages = append(messages, *pendingAssistant)
 			pendingAssistant = nil
+			// assistant turn 聚合完成后，按序输出缓存的工具结果；
+			// 若 tool 输出含图片 part，提取到 pendingImages（tool 消息不能带图）。
+			for _, po := range pendingOutputs {
+				toolMsg := Message{Role: "tool", ToolCallID: po.CallID, Content: po.Output}
+				if parts, ok := po.Output.([]any); ok {
+					var kept []any
+					for _, p := range parts {
+						if block, ok := p.(map[string]any); ok {
+							if block["type"] == "image_url" {
+								pendingImages = append(pendingImages, block)
+								continue
+							}
+						}
+						kept = append(kept, p)
+					}
+					if len(kept) > 0 {
+						toolMsg.Content = kept
+					} else {
+						toolMsg.Content = "[tool output image]"
+					}
+				}
+				messages = append(messages, toolMsg)
+			}
+			pendingOutputs = nil
 		}
 		appendPendingReasoning := func(text string) {
 			if text == "" {
@@ -2751,23 +5286,51 @@ func responsesInputToMessages(input any, instructions string) []Message {
 			switch elem := item.(type) {
 			case string:
 				flushPendingAssistant()
-				messages = append(messages, Message{Role: "user", Content: elem})
+				// 若之前有 tool 输出的图片，附加到本 user 消息（图片作为普通 user 内容或跟随上下文）
+				if len(pendingImages) > 0 {
+					parts := []any{map[string]any{"type": "text", "text": elem}}
+					for _, img := range pendingImages {
+						parts = append(parts, img)
+					}
+					messages = append(messages, Message{Role: "user", Content: parts})
+					pendingImages = nil
+				} else {
+					messages = append(messages, Message{Role: "user", Content: elem})
+				}
 			case map[string]any:
 				itemType, _ := elem["type"].(string)
 				switch itemType {
 				case "function_call", "tool_call":
+					if pendingAssistant != nil {
+						if existing, ok := pendingAssistant.Content.(string); ok && strings.TrimSpace(existing) != "" && len(pendingAssistant.ToolCalls) == 0 {
+							flushPendingAssistant()
+						}
+					}
 					if tc, ok := responsesToolCallFromItem(elem); ok {
 						msg := ensurePendingAssistant()
 						msg.ToolCalls = append(msg.ToolCalls, tc)
 					}
 				case "function_call_output", "tool_result":
-					flushPendingAssistant()
+					// 不立即 flush：同一 assistant turn 内可能有多个 function_call
+					// （codex 串行调工具时是 CO-CO 交替排布），立即 flush 会把它们
+					// 拆成多条 assistant 消息，导致后续消息丢失 reasoning_content
+					// （DeepSeek thinking 模式会拒绝）。先缓存输出，等当前 turn
+					// 聚合完成后再统一输出。
 					callID, output := responsesToolOutputFromItem(elem)
 					if callID != "" {
-						messages = append(messages, Message{Role: "tool", ToolCallID: callID, Content: output})
+						pendingOutputs = append(pendingOutputs, struct {
+							CallID string
+							Output any
+						}{callID, output})
 					}
 					continue
 				case "reasoning":
+					// 前一个 assistant turn 若还有未输出的 tool_calls（同一 turn
+					// 聚合中被新的 reasoning 打断），先 flush 它，避免新 reasoning
+					// 错误合并进旧 turn。连续 reasoning（无 tool_calls）时不 flush。
+					if pendingAssistant != nil && len(pendingAssistant.ToolCalls) > 0 {
+						flushPendingAssistant()
+					}
 					text := extractTextFromContentParts(elem["summary"])
 					if text == "" {
 						text = extractTextFromContentParts(elem["content"])
@@ -2787,12 +5350,24 @@ func responsesInputToMessages(input any, instructions string) []Message {
 					}
 					if role == "assistant" {
 						text := extractTextFromContentParts(elem["content"])
+						if pendingAssistant != nil && len(pendingAssistant.ToolCalls) > 0 && text != "" {
+							flushPendingAssistant()
+						}
 						appendPendingText(text)
 					} else {
 						flushPendingAssistant()
 						content := responsesContentToChatContent(elem["content"])
 						if role == "system" {
 							content = extractTextFromContentParts(elem["content"])
+						}
+						// tool 输出的图片附加到 user 消息（mimo 等上游不接受 tool 消息带图）
+						if role == "user" && len(pendingImages) > 0 {
+							parts := []any{content}
+							for _, img := range pendingImages {
+								parts = append(parts, img)
+							}
+							content = parts
+							pendingImages = nil
 						}
 						messages = append(messages, Message{Role: role, Content: content})
 					}
@@ -2803,7 +5378,7 @@ func responsesInputToMessages(input any, instructions string) []Message {
 						role = r
 					}
 					content := responsesContentToChatContent(elem["content"])
-					if content == "" || content == nil {
+					if content == "" {
 						b, _ := json.Marshal(elem)
 						content = string(b)
 					}
@@ -2866,7 +5441,7 @@ func responsesToolCallFromItem(elem map[string]any) (ToolCall, bool) {
 	}, true
 }
 
-func responsesToolOutputFromItem(elem map[string]any) (string, string) {
+func responsesToolOutputFromItem(elem map[string]any) (string, any) {
 	callID, _ := elem["call_id"].(string)
 	if callID == "" {
 		callID, _ = elem["tool_use_id"].(string)
@@ -2874,25 +5449,105 @@ func responsesToolOutputFromItem(elem map[string]any) (string, string) {
 	if callID == "" {
 		return "", ""
 	}
-	output := ""
+	var output any
 	switch o := elem["output"].(type) {
 	case string:
 		output = o
+	case []any:
+		if converted := responsesContentToChatContent(o); converted != "" {
+			output = converted
+		} else {
+			b, _ := json.Marshal(o)
+			output = string(b)
+		}
 	default:
 		if o != nil {
 			b, _ := json.Marshal(o)
 			output = string(b)
 		}
 	}
-	if output == "" {
+	switch v := output.(type) {
+	case nil:
 		output = "[tool output missing]"
+	case string:
+		if v == "" {
+			output = "[tool output missing]"
+		}
+	case []any:
+		if len(v) == 0 {
+			output = "[tool output missing]"
+		}
 	}
 	return callID, output
 }
 
-func convertResponsesTools(tools []ResponsesTool) []Tool {
-	converted, _ := convertResponsesToolsWithMappings(tools)
-	return converted
+// convertChatToolsToResponses 将 OpenAI Chat tools 转为 Responses tools 格式
+func convertChatToolsToResponses(tools []any) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, raw := range tools {
+		tool, ok := raw.(map[string]any)
+		if !ok || tool == nil {
+			continue
+		}
+		t, _ := tool["type"].(string)
+		if t == "" {
+			t = "function"
+		}
+		// Chat: {type:function, function:{name,description,parameters}}
+		// Responses: {type:function, name, description, parameters}
+		if fn, ok := tool["function"].(map[string]any); ok && fn != nil {
+			item := map[string]any{"type": "function"}
+			if name, ok := fn["name"].(string); ok {
+				item["name"] = name
+			}
+			if desc, ok := fn["description"].(string); ok {
+				item["description"] = desc
+			}
+			if params, ok := fn["parameters"]; ok {
+				item["parameters"] = params
+			} else {
+				item["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			out = append(out, item)
+			continue
+		}
+		// 已是 Responses 形态则尽量保留
+		item := map[string]any{"type": t}
+		for _, k := range []string{"name", "description", "parameters", "function"} {
+			if v, ok := tool[k]; ok {
+				item[k] = v
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// convertChatToolChoiceToResponses 将 OpenAI Chat tool_choice 转为 Responses tool_choice
+func convertChatToolChoiceToResponses(choice any) any {
+	if choice == nil {
+		return nil
+	}
+	switch v := choice.(type) {
+	case string:
+		return v
+	case map[string]any:
+		// Chat: {"type":"function","function":{"name":"xxx"}}
+		// Responses: {"type":"function","name":"xxx"}
+		if t, _ := v["type"].(string); t == "function" {
+			if fn, ok := v["function"].(map[string]any); ok {
+				if name, ok := fn["name"].(string); ok && name != "" {
+					return map[string]any{"type": "function", "name": name}
+				}
+			}
+			if name, ok := v["name"].(string); ok && name != "" {
+				return map[string]any{"type": "function", "name": name}
+			}
+		}
+		return v
+	default:
+		return choice
+	}
 }
 
 func convertResponsesToolsWithMappings(tools []ResponsesTool) ([]Tool, map[string]ResponseToolNameMapping) {
@@ -2991,28 +5646,6 @@ func convertResponsesToolChoice(choice any) any {
 		}
 	}
 	return choice
-}
-
-func collectFunctionOutputs(items []any) map[string]string {
-	outputs := map[string]string{}
-	for _, item := range items {
-		elem, ok := item.(map[string]any)
-		if !ok || elem["type"] != "function_call_output" {
-			continue
-		}
-		callID, _ := elem["call_id"].(string)
-		if callID == "" {
-			continue
-		}
-		switch v := elem["output"].(type) {
-		case string:
-			outputs[callID] = v
-		default:
-			b, _ := json.Marshal(v)
-			outputs[callID] = string(b)
-		}
-	}
-	return outputs
 }
 
 func responseFunctionCallItem(itemID, status, arguments, callID, name string, mappings map[string]ResponseToolNameMapping) map[string]any {
@@ -3177,17 +5810,84 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respReq.Model = resolveModel(respReq.Model)
+	resolvedModel, modelAliasInfo, upstreamName, upstream := resolveModel(respReq.Model)
+	if !isKnownAlias(respReq.Model) {
+		http.Error(w, `{"error":{"message":"model not found; only configured aliases are accepted","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		return
+	}
+	respReq.Model = resolvedModel
 	if respReq.Model == "" {
-		modelIDs := getModelIDs()
-		if len(modelIDs) > 0 {
-			respReq.Model = modelIDs[0]
-		} else {
-			respReq.Model = "deepseek-v4-flash-free"
-		}
+		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
+		return
 	}
 
-	// 多模态路由
+	if upstream != nil && upstream.APIType == UpstreamResponses {
+		rawBody, err := prepareResponsesPassthroughBody(body, respReq.Model, modelAliasInfo)
+		if err != nil {
+			log.Printf("[request invalid] path=/v1/responses mode=passthrough model=%q err=%v", respReq.Model, err)
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if respReq.Stream {
+			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
+			if err != nil || status < 200 || status >= 300 {
+				w.Header().Set("Content-Type", "application/json")
+				status = applyUpstreamErrorHeaders(w, upHeader, status)
+				w.WriteHeader(status)
+				if upResp != nil {
+					errBody, _ := io.ReadAll(upResp)
+					if len(errBody) > 0 {
+						w.Write(errBody)
+						return
+					}
+				}
+				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+			if err := proxyResponsesPassthroughStream(w, upResp, respReq.Model); err != nil && debugMode {
+				log.Printf("[responses raw stream proxy error] %v", err)
+			}
+			return
+		}
+
+		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, true)
+		if err != nil || status < 200 || status >= 300 {
+			w.Header().Set("Content-Type", "application/json")
+			status = applyUpstreamErrorHeaders(w, upHeader, status)
+			w.WriteHeader(status)
+			if len(respBody) > 0 {
+				w.Write(respBody)
+			} else {
+				json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error"}})
+			}
+			return
+		}
+		var usageResp map[string]any
+		if json.Unmarshal(respBody, &usageResp) == nil {
+			if u, ok := usageResp["usage"].(map[string]any); ok {
+				pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
+				ct, _ := getFloat(u, "completion_tokens", "output_tokens")
+				tt, _ := getFloat(u, "total_tokens")
+				if tt == 0 && pt+ct > 0 {
+					tt = pt + ct
+				}
+				if tt > 0 {
+					recordTokenUsage(respReq.Model, int64(pt), int64(ct), int64(tt))
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if debugMode {
+			log.Printf("[responses raw response]\n%s", string(respBody))
+		}
+		w.Write(respBody)
+		return
+	}
 
 	messages := respReq.Messages
 	if len(messages) == 0 {
@@ -3196,15 +5896,28 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		messages = append([]Message{{Role: "system", Content: respReq.Instructions}}, messages...)
 	}
 
+	// 多模态路由：只按"本轮新增图片"判定（历史图片不锁定多模态路由）。
+	// 配置了 multimodal_model 且本轮带图 → 切换到多模态模型与对应上游/代理；
+	// 否则保持 target_model。路由到纯文本模型时剥离所有历史图片。
+	if modelAliasInfo.MultimodalModel != "" {
+		var useMM bool
+		if hasNewImageContent(messages) {
+			useMM = true
+		} else {
+			// 纯文本轮次：剥离历史图片，避免纯文本上游（如 deepseek）报错
+			messages = stripImagesForTextModel(messages)
+		}
+		modelName, upName, up, proxy := resolveEffectiveModel(modelAliasInfo, respReq.Model, upstreamName, upstream, useMM)
+		respReq.Model = modelName
+		upstreamName = upName
+		upstream = up
+		modelAliasInfo.Socks5Proxy = proxy
+	}
+
 	chatReq := OpenAIRequest{
 		Model:    respReq.Model,
 		Messages: messages,
 		Stream:   respReq.Stream,
-	}
-	if respReq.Stream {
-		chatReq.ExtraBody = map[string]any{
-			"stream_options": map[string]any{"include_usage": true},
-		}
 	}
 	toolNameMappings := map[string]ResponseToolNameMapping{}
 	if respReq.Temperature != 0 {
@@ -3225,21 +5938,29 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if respReq.ParallelToolCalls != nil {
 		chatReq.ExtraBody = map[string]any{"parallel_tool_calls": *respReq.ParallelToolCalls}
 	}
-	// 将 Responses API reasoning.effort 映射到 Chat Completions
-	if !getForceDisableThinking() && respReq.Reasoning.Effort != "" {
+	// reasoning.effort describes the current request and is independent from
+	if respReq.Reasoning.Effort != "" {
 		if respReq.Reasoning.Effort != "none" {
 			chatReq.ReasoningEffort = respReq.Reasoning.Effort
 		}
 	}
 
 	chatReq.Messages = fixToolCallGaps(chatReq.Messages)
-	keepReasoning := wantsReasoning(&chatReq)
-	chatReq.Messages = ensureReasoningContent(chatReq.Messages, keepReasoning)
-
+	chatReq.Messages, err = normalizeMessagesToolCallArguments(chatReq.Messages)
+	if err != nil {
+		log.Printf("[request invalid] path=/v1/responses model=%q err=%v", chatReq.Model, err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	ensureReasoningEffort(&chatReq, modelAliasInfo)
+	chatReq.Messages = ensureReasoningContent(chatReq.Messages)
 	upstreamBody := buildUpstreamBody(&chatReq)
 
+	// callUpstream/callUpstreamStream 内部会根据当前请求选中的 upstream.APIType 自动转换请求格式
+	// 不需要在这里手动转换，避免双重转换导致请求体丢失
+	// 流式响应需要特殊处理
 	if respReq.Stream {
-		upResp, status, upHeader, err := callOpenCodeAPIStream(upstreamBody, chatReq.Model)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -3256,16 +5977,34 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		defer upResp.Close()
 
+		// 注：Responses 上游已在上方同协议直通处理，此处不会到达。
 		resp := &http.Response{
 			StatusCode: status,
 			Body:       upResp,
 			Header:     make(http.Header),
 		}
-		responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Model, keepReasoning, chatReq.Tools, chatReq.ToolChoice, toolNameMappings)
+		if upstream != nil && upstream.APIType == UpstreamAnthropic {
+			// Anthropic 上游：先转为 Chat SSE 流，再转为 Responses SSE 流
+			pr, pw := io.Pipe()
+			go func() {
+				defer pw.Close()
+				chatW := &pipeResponseWriter{w: pw}
+				anthropicStreamToChatHandler(chatW, upResp, chatReq.Model)
+			}()
+			chatResp := &http.Response{
+				StatusCode: status,
+				Body:       pr,
+				Header:     make(http.Header),
+			}
+			responsesStreamHandler(w, r, chatResp, chatReq.Model, chatReq.Tools, chatReq.ToolChoice, toolNameMappings)
+		} else {
+			// OpenAI 上游：Chat SSE 流直接转为 Responses SSE 流
+			responsesStreamHandler(w, r, resp, chatReq.Model, chatReq.Tools, chatReq.ToolChoice, toolNameMappings)
+		}
 		return
 	}
 
-	respBody, status, upHeader, err := callOpenCodeAPI(upstreamBody, chatReq.Model)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -3278,14 +6017,19 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responsesBody := convertChatToResponses(respBody, chatReq.Model, keepReasoning, chatReq.Tools, chatReq.ToolChoice, toolNameMappings)
+	// 注：Responses 上游已在上方同协议直通处理，此处不会到达。
+	// callUpstream 返回的 respBody 已统一为 Chat 格式，再转为 Responses API 格式
+	responsesBody := convertChatToResponses(respBody, chatReq.Model, chatReq.Tools, chatReq.ToolChoice, toolNameMappings)
 
-	var usageResp map[string]any
-	if json.Unmarshal(respBody, &usageResp) == nil {
-		if u, ok := usageResp["usage"].(map[string]any); ok {
-			pt, _ := u["prompt_tokens"].(float64)
-			ct, _ := u["completion_tokens"].(float64)
-			tt, _ := u["total_tokens"].(float64)
+	var usageResp2 map[string]any
+	if json.Unmarshal(respBody, &usageResp2) == nil {
+		if u, ok := usageResp2["usage"].(map[string]any); ok {
+			pt, _ := getFloat(u, "prompt_tokens", "input_tokens")
+			ct, _ := getFloat(u, "completion_tokens", "output_tokens")
+			tt, _ := getFloat(u, "total_tokens")
+			if tt == 0 && pt+ct > 0 {
+				tt = pt + ct
+			}
 			if tt > 0 {
 				recordTokenUsage(chatReq.Model, int64(pt), int64(ct), int64(tt))
 			}
@@ -3301,7 +6045,9 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 // ======================== Responses Stream Handler ========================
 
-func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.Response, model string, _ string, wantReasoning bool, tools []Tool, toolChoice any, toolNameMappings map[string]ResponseToolNameMapping) {
+func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.Response, model string, tools []Tool, toolChoice any, toolNameMappings map[string]ResponseToolNameMapping) {
+	// 必须关闭：作为 pipe 读端时，提前 return 会让写端 goroutine 永久阻塞
+	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -3320,6 +6066,9 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	reasoningDone := false
 	messageStarted := false
 	messageDone := false
+	isIncomplete := false
+	incompleteReason := ""
+	terminalFinishSeen := false
 	fullReasoning := ""
 	fullText := ""
 	totalUsage := map[string]any{}
@@ -3438,25 +6187,35 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if done, _ := call["done"].(bool); done {
 			return
 		}
-		call["done"] = true
 		itemID, _ := call["item_id"].(string)
 		callID, _ := call["call_id"].(string)
 		name, _ := call["name"].(string)
 		args, _ := call["arguments"].(string)
+		normalizedArgs, err := normalizeToolCallArguments(args)
+		if err != nil {
+			logStreamToolCallArgumentsValidationFailure("responsesStreamHandler.emitToolCallDone", itemID, callID, name, args, idx, err)
+			isIncomplete = true
+			if incompleteReason == "" {
+				incompleteReason = "tool_call_arguments_incomplete"
+			}
+			return
+		}
+		call["arguments"] = normalizedArgs
+		call["done"] = true
 		seq++
 		emitSSEEvent(w, flusher, "response.function_call_arguments.done", map[string]any{
 			"type":            "response.function_call_arguments.done",
 			"sequence_number": seq,
 			"item_id":         itemID,
 			"output_index":    idx,
-			"arguments":       args,
+			"arguments":       normalizedArgs,
 		})
 		seq++
 		emitSSEEvent(w, flusher, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
 			"sequence_number": seq,
 			"output_index":    idx,
-			"item":            responseFunctionCallItem(itemID, "completed", args, callID, name, toolNameMappings),
+			"item":            responseFunctionCallItem(itemID, "completed", normalizedArgs, callID, name, toolNameMappings),
 		})
 	}
 
@@ -3518,9 +6277,10 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 
 		choice, _ := choices[0].(map[string]any)
 		delta, _ := choice["delta"].(map[string]any)
+		normalizeReasoningContent(delta)
 		finishReason, _ := choice["finish_reason"].(string)
 
-		if rc, ok := delta["reasoning_content"]; ok && wantReasoning {
+		if rc, ok := delta["reasoning_content"]; ok {
 			rcStr, _ := rc.(string)
 			if rcStr != "" {
 				if !reasoningStarted {
@@ -3653,7 +6413,12 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if usage, ok := chunk["usage"].(map[string]any); ok {
 			totalUsage = usage
 		}
-		if finishReason == "stop" || finishReason == "length" || finishReason == "content_filter" {
+		if finishReason == "stop" || finishReason == "length" || finishReason == "tool_calls" || finishReason == "function_call" || finishReason == "content_filter" {
+			terminalFinishSeen = true
+			if finishReason == "length" {
+				isIncomplete = true
+				incompleteReason = "max_output_tokens"
+			}
 			emitReasoningDone()
 			if !messageStarted && len(toolCalls) == 0 {
 				idx := messageOutputIndex()
@@ -3682,10 +6447,20 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		}
 	}
 
+	if !terminalFinishSeen {
+		isIncomplete = true
+		if incompleteReason == "" {
+			incompleteReason = "stream_ended_early"
+		}
+		log.Printf("[responses stream incomplete] model=%q reason=%s message_started=%t tool_calls=%d", model, incompleteReason, messageStarted, len(toolOrder))
+	}
+
 	emitReasoningDone()
 	emitMessageDone()
-	for _, idx := range toolOrder {
-		emitToolCallDone(toolCalls[idx]["output_index"].(int), toolCalls[idx])
+	if terminalFinishSeen {
+		for _, idx := range toolOrder {
+			emitToolCallDone(toolCalls[idx]["output_index"].(int), toolCalls[idx])
+		}
 	}
 
 	output := []any{}
@@ -3697,36 +6472,75 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	}
 	for _, idx := range toolOrder {
 		call := toolCalls[idx]
+		args, _ := call["arguments"].(string)
+		normalizedArgs, err := normalizeToolCallArguments(args)
+		if err != nil {
+			itemID, _ := call["item_id"].(string)
+			callID, _ := call["call_id"].(string)
+			name, _ := call["name"].(string)
+			logStreamToolCallArgumentsValidationFailure("responsesStreamHandler.output", itemID, callID, name, args, call["output_index"].(int), err)
+			isIncomplete = true
+			if incompleteReason == "" {
+				incompleteReason = "tool_call_arguments_incomplete"
+			}
+			continue
+		}
+		call["arguments"] = normalizedArgs
+		itemStatus := "completed"
+		if !terminalFinishSeen {
+			itemStatus = "in_progress"
+		}
 		output = append(output, responseFunctionCallItem(
 			call["item_id"].(string),
-			"completed",
-			call["arguments"].(string),
+			itemStatus,
+			normalizedArgs,
 			call["call_id"].(string),
 			call["name"].(string),
 			toolNameMappings,
 		))
 	}
 
+	responseStatus := "completed"
+	incompleteDetails := any(nil)
+	if isIncomplete {
+		responseStatus = "incomplete"
+		reason := incompleteReason
+		if reason == "" {
+			reason = "max_output_tokens"
+		}
+		incompleteDetails = map[string]any{"reason": reason}
+	}
 	completedResponse := map[string]any{
 		"id":                 responseID,
 		"object":             "response",
 		"created_at":         createdAt,
-		"status":             "completed",
+		"status":             responseStatus,
 		"background":         false,
 		"error":              nil,
-		"incomplete_details": nil,
+		"incomplete_details": incompleteDetails,
 		"model":              model,
 		"output":             output,
 	}
 	if len(tools) > 0 {
-		completedResponse["tools"] = tools
+		rawTools := make([]any, 0, len(tools))
+		for _, t := range tools {
+			rawTools = append(rawTools, map[string]any{
+				"type": t.Type,
+				"function": map[string]any{
+					"name":        t.Function.Name,
+					"description": t.Function.Description,
+					"parameters":  t.Function.Parameters,
+				},
+			})
+		}
+		completedResponse["tools"] = convertChatToolsToResponses(rawTools)
 	}
 	if toolChoice != nil {
-		completedResponse["tool_choice"] = toolChoice
+		completedResponse["tool_choice"] = convertChatToolChoiceToResponses(toolChoice)
 	}
 
+	usage := map[string]any{}
 	if len(totalUsage) > 0 {
-		usage := map[string]any{}
 		if v, ok := totalUsage["prompt_tokens"]; ok {
 			usage["input_tokens"] = v
 		}
@@ -3750,23 +6564,55 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 		if v, ok := totalUsage["output_tokens"]; ok && usage["output_tokens"] == nil {
 			usage["output_tokens"] = v
 		}
-		completedResponse["usage"] = usage
 	}
+	// Always ensure total_tokens is present
+	if _, ok := usage["total_tokens"]; !ok {
+		pt := float64(0)
+		ct := float64(0)
+		if v, ok := usage["input_tokens"].(float64); ok {
+			pt = v
+		} else if v, ok := usage["input_tokens"].(int64); ok {
+			pt = float64(v)
+		}
+		if v, ok := usage["output_tokens"].(float64); ok {
+			ct = v
+		} else if v, ok := usage["output_tokens"].(int64); ok {
+			ct = float64(v)
+		}
+		usage["total_tokens"] = pt + ct
+	}
+	// 确保 usage 字段完整
+	if _, ok := usage["input_tokens"]; !ok {
+		usage["input_tokens"] = float64(0)
+	}
+	if _, ok := usage["output_tokens"]; !ok {
+		usage["output_tokens"] = float64(0)
+	}
+	// 补齐必填嵌套字段（对标 opencode2api 的 normalizeUsageDetails）：
+	// codex 客户端反序列化 response.completed 时 input_tokens_details.cached_tokens
+	// 与 output_tokens_details.reasoning_tokens 均为必填，上游缺失会报
+	// "missing field cached_tokens/reasoning_tokens"。
+	if od, ok := usage["output_tokens_details"].(map[string]any); ok {
+		if _, ok := od["reasoning_tokens"]; !ok {
+			od["reasoning_tokens"] = float64(0)
+		}
+	} else if usage["output_tokens_details"] == nil {
+		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": 0}
+	}
+	completedResponse["usage"] = usage
 
-	if totalUsage != nil {
-		pt, _ := totalUsage["prompt_tokens"].(float64)
-		ct, _ := totalUsage["completion_tokens"].(float64)
-		tt, _ := totalUsage["total_tokens"].(float64)
+	if len(totalUsage) > 0 {
+		pt, _ := getFloat(totalUsage, "prompt_tokens", "input_tokens")
+		ct, _ := getFloat(totalUsage, "completion_tokens", "output_tokens")
+		tt := pt + ct
 		if tt > 0 {
 			recordTokenUsage(model, int64(pt), int64(ct), int64(tt))
 		}
 	}
 
-	seq++
-	emitSSEEvent(w, flusher, "response.completed", map[string]any{
-		"type":            "response.completed",
-		"sequence_number": seq,
-		"response":        completedResponse,
+	emitSSEEvent(w, flusher, "response."+responseStatus, map[string]any{
+		"type":     "response." + responseStatus,
+		"response": completedResponse,
 	})
 
 	if flusher != nil {
@@ -3774,7 +6620,7 @@ func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.R
 	}
 }
 
-func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, tools []Tool, toolChoice any, toolNameMappings map[string]ResponseToolNameMapping) []byte {
+func convertChatToResponses(chatBody []byte, model string, tools []Tool, toolChoice any, toolNameMappings map[string]ResponseToolNameMapping) []byte {
 	var chat struct {
 		ID      string `json:"id"`
 		Created int64  `json:"created"`
@@ -3783,6 +6629,7 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 			Message      struct {
 				Content          string     `json:"content"`
 				ReasoningContent string     `json:"reasoning_content"`
+				Reasoning        string     `json:"reasoning"`
 				ToolCalls        []ToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
@@ -3798,8 +6645,9 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 	var toolCalls []ToolCall
 	if len(chat.Choices) > 0 {
 		text = chat.Choices[0].Message.Content
-		if wantReasoning {
-			reasoning = chat.Choices[0].Message.ReasoningContent
+		reasoning = chat.Choices[0].Message.ReasoningContent
+		if reasoning == "" {
+			reasoning = chat.Choices[0].Message.Reasoning
 		}
 		toolCalls = chat.Choices[0].Message.ToolCalls
 		finishReason = chat.Choices[0].FinishReason
@@ -3821,10 +6669,22 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		"created_at":         chat.Created,
 	}
 	if len(tools) > 0 {
-		responses["tools"] = tools
+		// 回显时使用 Responses tools 形态
+		rawTools := make([]any, 0, len(tools))
+		for _, t := range tools {
+			rawTools = append(rawTools, map[string]any{
+				"type": t.Type,
+				"function": map[string]any{
+					"name":        t.Function.Name,
+					"description": t.Function.Description,
+					"parameters":  t.Function.Parameters,
+				},
+			})
+		}
+		responses["tools"] = convertChatToolsToResponses(rawTools)
 	}
 	if toolChoice != nil {
-		responses["tool_choice"] = toolChoice
+		responses["tool_choice"] = convertChatToolChoiceToResponses(toolChoice)
 	}
 	outputID := "msg_" + chat.ID + "_0"
 	output := []any{}
@@ -3836,7 +6696,8 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 			"summary":           []any{map[string]any{"type": "summary_text", "text": reasoning}},
 		})
 	}
-	if text != "" {
+	// 有文本时输出 message；仅有 tool_calls 时不注入空 message（与流式路径一致）
+	if text != "" || len(toolCalls) == 0 {
 		output = append(output, map[string]any{
 			"id":     outputID,
 			"type":   "message",
@@ -3854,8 +6715,8 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		output = append(output, responseFunctionCallItem("fc_"+tc.ID, "completed", tc.Function.Arguments, tc.ID, tc.Function.Name, toolNameMappings))
 	}
 	responses["output"] = output
+	usage := map[string]any{}
 	if chat.Usage != nil {
-		usage := map[string]any{}
 		if v, ok := chat.Usage["prompt_tokens"]; ok {
 			usage["input_tokens"] = v
 		}
@@ -3879,9 +6740,42 @@ func convertChatToResponses(chatBody []byte, model string, wantReasoning bool, t
 		if v, ok := chat.Usage["output_tokens"]; ok && usage["output_tokens"] == nil {
 			usage["output_tokens"] = v
 		}
-		responses["usage"] = usage
 	}
+	// Always ensure total_tokens is present
+	if _, ok := usage["total_tokens"]; !ok {
+		pt := float64(0)
+		ct := float64(0)
+		if v, ok := usage["input_tokens"].(float64); ok {
+			pt = v
+		} else if v, ok := usage["input_tokens"].(int64); ok {
+			pt = float64(v)
+		}
+		if v, ok := usage["output_tokens"].(float64); ok {
+			ct = v
+		} else if v, ok := usage["output_tokens"].(int64); ok {
+			ct = float64(v)
+		}
+		usage["total_tokens"] = pt + ct
+	}
+	// 确保 usage 字段完整
+	if _, ok := usage["input_tokens"]; !ok {
+		usage["input_tokens"] = float64(0)
+	}
+	if _, ok := usage["output_tokens"]; !ok {
+		usage["output_tokens"] = float64(0)
+	}
+	// 补齐必填嵌套字段（对标 opencode2api 的 normalizeUsageDetails）：
+	// output_tokens_details.reasoning_tokens 对 codex 客户端反序列化是必填。
+	if od, ok := usage["output_tokens_details"].(map[string]any); ok {
+		if _, ok := od["reasoning_tokens"]; !ok {
+			od["reasoning_tokens"] = float64(0)
+		}
+	} else if usage["output_tokens_details"] == nil {
+		usage["output_tokens_details"] = map[string]any{"reasoning_tokens": 0}
+	}
+	responses["usage"] = usage
 
+	// 非流式 Responses API 直接返回 response 对象，不包成 SSE 事件外壳
 	result, _ := json.Marshal(responses)
 	return result
 }
@@ -3901,25 +6795,89 @@ func emitSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, dat
 
 // ======================== Admin 管理页面 ========================
 
+func upstreamModelsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	var probe *UpstreamConfig
+	if r.Method == http.MethodPost && r.Body != nil {
+		// 优先用请求体里的临时配置(未保存也能拉取),实现"填好 URL+key 直接试拉"。
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body failed", http.StatusBadRequest)
+			return
+		}
+		if len(strings.TrimSpace(string(data))) > 0 {
+			probe = &UpstreamConfig{}
+			if err := json.Unmarshal(data, probe); err != nil {
+				http.Error(w, "invalid config json", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	if probe == nil {
+		// 没传请求体时回退用已保存配置(name 必填)。
+		if name == "" {
+			http.Error(w, "missing name", http.StatusBadRequest)
+			return
+		}
+		_, up := resolveUpstream(name)
+		if up == nil || up.BaseURL == "" {
+			http.Error(w, "upstream not found", http.StatusNotFound)
+			return
+		}
+		probe = cloneUpstreamConfig(up)
+	}
+	if probe.BaseURL == "" {
+		http.Error(w, "missing base_url", http.StatusBadRequest)
+		return
+	}
+	if name == "" {
+		name = "preview"
+	}
+	// 始终向上游 /models 实时拉取,忽略已配置的 custom_models 快照。
+	probe.CustomModels = nil
+	models, err := fetchModelsFromUpstream(name, probe)
+	if err != nil {
+		log.Printf("上游 %s 模型拉取失败: %v", name, err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	ids := make([]string, 0, len(models))
+	seen := map[string]struct{}{}
+	for _, m := range models {
+		trimmed := strings.TrimSpace(m.ID)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		ids = append(ids, trimmed)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"upstream": name,
+		"models":   ids,
+		"count":    len(ids),
+	})
+}
+
 func reloadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	refreshOCSession()
-	fetched, err := fetchModels()
-	if err == nil && len(fetched) > 0 {
-		modelMu.Lock()
-		modelsCache = fetched
-		modelsLoaded = true
-		modelMu.Unlock()
-		log.Printf("模型列表已刷新: %d 个模型", len(fetched))
-	}
+
+	// 模型完全由用户在 custom_models 中配置，无需联网拉取。
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"status":  "ok",
-		"session": ocSessionID,
-		"models":  len(modelsCache),
+		"status":    "ok",
+		"upstreams": getConfiguredUpstreamCount(),
+		"models":    countConfiguredModels(),
 	})
 }
 
@@ -3927,14 +6885,26 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		configMu.RLock()
-		cfg := AppConfig{ModelAlias: modelAlias, ReasoningEffortMap: reasoningEffortMap, ForceDisableThinking: forceDisableThinking}
+		cfg := AppConfig{
+			ModelAlias:         modelAlias,
+			ReasoningEffortMap: reasoningEffortMap,
+			Upstreams:          map[string]*UpstreamConfig{},
+		}
+		for name, upstream := range upstreamCfgs {
+			cfg.Upstreams[name] = cloneUpstreamConfig(upstream)
+		}
 		configMu.RUnlock()
 		socks5Mu.RLock()
 		cfg.Socks5Proxies = socks5Proxies
-		cfg.ActiveSocks5 = activeSocks5
 		socks5Mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(cfg)
+		resp := map[string]any{
+			"model_alias":          cfg.ModelAlias,
+			"reasoning_effort_map": cfg.ReasoningEffortMap,
+			"socks5_proxies":       cfg.Socks5Proxies,
+			"upstreams":            cfg.Upstreams,
+		}
+		json.NewEncoder(w).Encode(resp)
 	case http.MethodPost:
 		var cfg AppConfig
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
@@ -3942,13 +6912,54 @@ func adminConfigHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		normalizeConfig(&cfg)
+		if empty := emptyCustomModelUpstreams(cfg.Upstreams); len(empty) > 0 {
+			msg := "以下上游未配置模型，请点击\"获取模型列表\"或手动填写：" + strings.Join(empty, "、")
+			http.Error(w, `{"error":"`+msg+`"}`, http.StatusBadRequest)
+			return
+		}
+		// 校验别名引用的上游是否存在（前端已拦空 key/重复 key，这里后端兜底孤儿上游）
+		for aliasKey, alias := range cfg.ModelAlias {
+			if aliasUpstream := strings.TrimSpace(alias.Upstream); aliasUpstream != "" {
+				if _, ok := cfg.Upstreams[aliasUpstream]; !ok {
+					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的上游 `+aliasUpstream+` 不存在"}`, http.StatusBadRequest)
+					return
+				}
+			}
+			// 多模态独立上游同样校验
+			if mmUpstream := strings.TrimSpace(alias.MultimodalUpstream); mmUpstream != "" {
+				if _, ok := cfg.Upstreams[mmUpstream]; !ok {
+					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的多模态上游 `+mmUpstream+` 不存在"}`, http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		// 校验别名引用的 SOCKS5 代理是否存在（不再静默清空，避免用户不知情丢失配置）
+		proxyAddrSet := make(map[string]struct{}, len(cfg.Socks5Proxies))
+		for _, proxy := range cfg.Socks5Proxies {
+			proxyAddrSet[strings.TrimSpace(proxy.Addr)] = struct{}{}
+		}
+		for aliasKey, alias := range cfg.ModelAlias {
+			if aliasProxy := strings.TrimSpace(alias.Socks5Proxy); aliasProxy != "" {
+				if _, ok := proxyAddrSet[aliasProxy]; !ok {
+					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的代理 `+aliasProxy+` 不存在"}`, http.StatusBadRequest)
+					return
+				}
+			}
+			// 多模态独立代理同样校验
+			if mmProxy := strings.TrimSpace(alias.MultimodalSocks5Proxy); mmProxy != "" {
+				if _, ok := proxyAddrSet[mmProxy]; !ok {
+					http.Error(w, `{"error":"别名 `+aliasKey+` 引用的多模态代理 `+mmProxy+` 不存在"}`, http.StatusBadRequest)
+					return
+				}
+			}
+		}
 		if err := saveConfig(configPath, cfg); err != nil {
 			http.Error(w, `{"error":"Failed to save config"}`, http.StatusInternalServerError)
 			return
 		}
-		applyConfig(cfg)
+		upstreamsChanged := applyConfig(cfg)
 		if debugMode {
-			log.Printf("Config updated: aliases=%d, effort_map=%d, force_disable=%v", len(cfg.ModelAlias), len(cfg.ReasoningEffortMap), cfg.ForceDisableThinking)
+			log.Printf("Config updated: aliases=%d, effort_map=%d, upstreams=%d, upstreams_changed=%v", len(cfg.ModelAlias), len(cfg.ReasoningEffortMap), len(cfg.Upstreams), upstreamsChanged)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -4000,9 +7011,7 @@ const adminLoginHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>登录 — OPENCODE TO API</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<title>登录 — LLM Gateway</title>
 <style>
 :root{--bg:#f4f6fa;--surface:#fff;--border:#e2e6ed;--text:#1a1d26;--text-sec:#6a7180;--accent:#6c8aff;--accent-hover:#5a78f0;--radius:12px;--radius-sm:8px;--font:'Noto Sans SC',system-ui,-apple-system,sans-serif;--mono:'JetBrains Mono',Consolas,monospace}
 [data-theme="dark"]{--bg:#0c0e14;--surface:#14161e;--border:#252835;--text:#e8eaf0;--text-sec:#8b90a5;--accent:#6c8aff;--accent-hover:#5a78f0}
@@ -4037,7 +7046,7 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <div class="logo">
 <div class="logo-mark">⌨</div>
 <div>
-<div class="logo-text">OPENCODE TO API</div>
+<div class="logo-text">LLM Gateway</div>
 <div class="logo-sub">管理面板</div>
 </div>
 </div>
@@ -4066,9 +7075,7 @@ const adminHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OPENCODE TO API 管理面板</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<title>LLM Gateway 管理面板</title>
 <style>
 :root {
   --bg: #f4f6fa;
@@ -4156,12 +7163,15 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 .btn-warning:hover{background:var(--orange);color:#fff}
 .btn-danger{background:var(--red-dim);color:var(--red)}
 .btn-danger:hover{background:var(--red);color:#fff}
+.btn-secondary{background:var(--surface);color:var(--text-ter);border:1px solid var(--border)}
+.btn-secondary:hover{background:var(--accent-dim);color:var(--accent);border-color:var(--accent)}
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
 .tbl th{text-align:left;font-weight:500;color:var(--text-ter);padding:8px 10px;border-bottom:1px solid var(--border);font-size:11px;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}
 .tbl td{padding:7px 10px;border-bottom:1px solid var(--border)}
 .tbl tr:last-child td{border-bottom:none}
-.tbl input{width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
-.tbl input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.tbl input,.tbl textarea{width:100%;padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface-2);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.tbl textarea{min-height:72px;resize:vertical;line-height:1.4}
+.tbl input:focus,.tbl textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
 .tbl .m-select{padding:6px 10px;font-size:12.5px}
 .tbl th:last-child{width:52px}
 .tbl td:last-child{white-space:nowrap;text-align:center}
@@ -4180,17 +7190,66 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 #dailyTable thead+tbody tr:last-child td{font-weight:600;color:var(--text);background:var(--stats-total-bg);border-top:1px solid var(--border-light)}
 .stats-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 .stats-header .btns{display:flex;gap:6px;align-items:center}
+.panel-header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px}
+.panel-header h2{margin-bottom:0}
+.panel-header .btns{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.upstream-list{display:flex;flex-direction:column;gap:10px}
+.upstream-item{border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);overflow:hidden;transition:border-color .15s}
+.upstream-item:hover{border-color:var(--border-light)}
+.upstream-item summary{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;list-style:none;user-select:none}
+.upstream-item summary::-webkit-details-marker{display:none}
+.upstream-item summary::before{content:'›';font-size:19px;line-height:1;color:var(--text-ter);transition:transform .15s;flex-shrink:0}
+.upstream-item[open] summary::before{transform:rotate(90deg)}
+.upstream-item[open] summary{border-bottom:1px solid var(--border)}
+.upstream-summary-name{font-size:13px;font-weight:600;color:var(--text);min-width:110px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upstream-type-badge{padding:2px 7px;border-radius:999px;font-size:10px;line-height:1.5;white-space:nowrap}
+.upstream-type-badge{background:var(--accent-dim);color:var(--accent)}
+.upstream-summary-url{min-width:0;flex:1;color:var(--text-ter);font-family:var(--mono);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.upstream-summary-meta{color:var(--text-ter);font-size:10.5px;white-space:nowrap}
+.upstream-body{padding:15px 14px 14px}
+.upstream-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.upstream-field{min-width:0}
+.upstream-field.full{grid-column:1/-1}
+.upstream-field label{display:block;font-size:10.5px;font-weight:500;color:var(--text-ter);margin-bottom:5px;letter-spacing:.35px;text-transform:uppercase}
+.upstream-field input,.upstream-field textarea,.upstream-field select{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.upstream-field textarea{min-height:92px;resize:vertical;line-height:1.45}
+.upstream-field input:focus,.upstream-field textarea:focus,.upstream-field select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.upstream-field .field-hint{margin-top:4px;color:var(--text-ter);font-size:10.5px}
+.upstream-item-actions{display:flex;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)}
+.custom-models-row{display:flex;gap:8px}
+.custom-models-row input{flex:1;min-width:0}
+.custom-models-row .btn{flex:0 0 auto;align-self:flex-end;padding:8px 12px}
+.upstream-empty{padding:24px;text-align:center;color:var(--text-ter);font-size:12.5px;border:1px dashed var(--border);border-radius:var(--radius-sm);background:var(--surface-2)}
 #toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;color:#fff;opacity:0;transition:opacity .25s,transform .25s;z-index:999;transform:translateY(-8px);pointer-events:none;backdrop-filter:blur(8px)}
 #toast.success{background:rgba(61,214,140,.85)}
 #toast.error{background:rgba(240,96,96,.85)}
 #toast.show{opacity:1;transform:translateY(0)}
 .empty-hint{color:var(--text-ter);font-size:13px;padding:28px;text-align:center}
+.advanced-settings{margin-top:18px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2);overflow:hidden;transition:border-color .15s}
+.advanced-settings:hover{border-color:var(--border-light)}
+.advanced-settings summary{display:flex;align-items:center;gap:9px;padding:11px 14px;cursor:pointer;list-style:none;color:var(--text-sec);font-size:12.5px;font-weight:600;user-select:none}
+.advanced-settings summary::-webkit-details-marker{display:none}
+.advanced-settings summary::before{content:'›';font-size:18px;line-height:1;color:var(--text-ter);transition:transform .15s}
+.advanced-settings[open] summary::before{transform:rotate(90deg)}
+.advanced-settings[open] summary{border-bottom:1px solid var(--border)}
+.advanced-summary-count{margin-left:auto;color:var(--text-ter);font-size:11px;font-weight:400}
+.advanced-content{padding:14px}
+.advanced-hint{font-size:11px;color:var(--text-ter);margin-bottom:10px}
+.effort-label-row,.effort-row{display:grid;grid-template-columns:minmax(120px,1fr) 28px minmax(120px,1fr) auto;gap:8px;align-items:center}
+.effort-label-row{padding:0 1px 5px;color:var(--text-ter);font-size:10.5px;letter-spacing:.3px;text-transform:uppercase}
+.effort-row{margin-bottom:8px}
+.effort-row input{width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:12.5px;font-family:var(--mono);background:var(--surface);color:var(--text);transition:border-color .15s,box-shadow .15s}
+.effort-row input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-dim)}
+.effort-arrow{text-align:center;color:var(--text-ter);font-family:var(--mono)}
+.effort-row .btn{padding:6px 10px;font-size:11px}
+.effort-empty{padding:16px 8px;color:var(--text-ter);font-size:12px;text-align:center;border:1px dashed var(--border);border-radius:6px}
+.effort-actions{margin-top:10px}
 .think-row{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:12px;transition:border-color .15s}
 .think-row:hover{border-color:var(--border-light)}
 .think-row input[type="checkbox"]{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
 .think-row label{font-size:13px;font-weight:500;cursor:pointer;margin:0;color:var(--text)}
 .think-row .hint{font-size:11px;color:var(--text-ter);margin:0 0 0 auto;white-space:nowrap}
-@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}}
+@media(max-width:700px){.config-grid{grid-template-columns:1fr}.container{padding:16px 12px}header{flex-direction:column;align-items:flex-start;gap:8px}.effort-label-row,.effort-row{grid-template-columns:minmax(90px,1fr) 22px minmax(90px,1fr) auto}.upstream-form-grid{grid-template-columns:1fr}.upstream-field.full{grid-column:auto}.upstream-summary-url{display:none}.upstream-summary-meta{margin-left:auto}}
 .theme-toggle{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:6px 12px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:all .15s;color:var(--text-sec);flex-shrink:0;line-height:1}
 .theme-toggle:hover{border-color:var(--border-light);color:var(--text)}
 </style>
@@ -4201,8 +7260,8 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 <div class="logo">
 <div class="logo-mark">⌨</div>
 <div>
-<div class="logo-text">OPENCODE TO API</div>
-<div class="logo-sub">OpenCode 免费 API → 兼容格式代理</div>
+<div class="logo-text">LLM Gateway</div>
+<div class="logo-sub">通用 LLM 代理网关</div>
 </div>
 </div>
 <div style="display:flex;align-items:center;gap:8px">
@@ -4226,33 +7285,33 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 
 <div class="config-grid">
-<div class="card">
-<h2><span class="dot" style="background:var(--orange)"></span>推理力度映射</h2>
-<div style="margin-bottom:12px">
-<table class="tbl" id="effortTable">
-<thead><tr><th style="width:35%">请求值</th><th style="width:42%">映射值</th><th style="width:23%"></th></tr></thead>
-<tbody></tbody>
-</table>
-</div>
-<div class="think-row">
-<input type="checkbox" id="force_disable_thinking">
-<label for="force_disable_thinking">强制禁用思考模式</label>
-<span class="hint">移除所有推理内容</span>
-</div>
-<div class="actions">
-<button class="btn btn-primary" onclick="addEffortRow()">添加映射</button>
-<button class="btn btn-success" onclick="saveConfig()">保存全部</button>
+<div class="card full-row">
+<div class="panel-header">
+<h2><span class="dot" style="background:var(--green)"></span>多上游配置</h2>
+<div class="btns">
+<button class="btn btn-primary" onclick="addUpstreamRow()">添加上游</button>
+<button class="btn btn-success" onclick="saveConfig('上游配置')">保存上游</button>
 </div>
 </div>
-
-<div class="card">
+<div class="upstream-list" id="upstreamList"></div>
+</div>
+<div class="card full-row">
 <h2><span class="dot" style="background:var(--accent)"></span>模型映射</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="aliasTable">
-<thead><tr><th style="width:35%">别名（请求名）</th><th style="width:42%">实际模型（上游名）</th><th style="width:23%"></th></tr></thead>
+<thead><tr><th rowspan="2" style="width:13%">别名（客户端请求名）</th><th colspan="3">主路由</th><th rowspan="2" style="width:4%"></th></tr><tr><th colspan="3">多模态路由</th></tr></thead>
 <tbody></tbody>
 </table>
 </div>
+<details class="advanced-settings" id="reasoningEffortDetails">
+<summary><span>高级设置 · 推理力度映射</span><span class="advanced-summary-count" id="effortSummary">未配置 · 原值透传</span></summary>
+<div class="advanced-content">
+<div class="advanced-hint">将客户端传入的 reasoning_effort 映射为上游支持的值；未配置的值保持原样。</div>
+<div class="effort-label-row"><span>请求值</span><span></span><span>上游值</span><span></span></div>
+<div id="effortList"></div>
+<div class="effort-actions"><button class="btn btn-primary" onclick="addEffortRow()">添加映射</button></div>
+</div>
+</details>
 <div class="actions">
 <button class="btn btn-primary" onclick="addAliasRow()">添加别名</button>
 <button class="btn btn-success" onclick="saveConfig()">保存全部</button>
@@ -4260,18 +7319,12 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 
 <div class="card full-row">
-<h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理</h2>
+<h2><span class="dot" style="background:var(--accent)"></span>SOCKS5 代理配置</h2>
 <div style="margin-bottom:12px">
 <table class="tbl" id="socks5Table">
 <thead><tr><th style="width:25%">名称</th><th style="width:28%">地址</th><th style="width:17%">用户名</th><th style="width:17%">密码</th><th style="width:13%"></th></tr></thead>
 <tbody></tbody>
 </table>
-</div>
-<div class="form-group">
-<label>启用代理</label>
-<select id="activeSocks5" class="m-select">
-<option value="">直连（不使用代理）</option>
-</select>
 </div>
 <div class="actions">
 <button class="btn btn-primary" onclick="addSocks5Row()">添加代理</button>
@@ -4282,33 +7335,65 @@ header{display:flex;align-items:flex-end;gap:16px;margin-bottom:28px;padding-bot
 </div>
 <div id="toast"></div>
 <script>
-let aliasData={},effortData={},modelList=[],socks5Data=[];
+let aliasData={},effortData={},modelListByUpstream={},upstreamData={},socks5Data=[];
 function toggleTheme(){const d=document.documentElement;const cur=d.getAttribute('data-theme');const next=cur==='dark'?null:'dark';if(next)d.setAttribute('data-theme',next);else d.removeAttribute('data-theme');localStorage.setItem('theme',next||'light');document.querySelector('.theme-toggle').textContent=next==='dark'?'🌙':'☀'}
 (function(){const t=localStorage.getItem('theme');if(t==='dark'){document.documentElement.setAttribute('data-theme','dark');document.addEventListener('DOMContentLoaded',()=>{const b=document.querySelector('.theme-toggle');if(b)b.textContent='🌙'})}})();
 function reloadConfig(){const sy=window.scrollY;fetch('/api/reload',{method:'POST'}).then(r=>r.json()).then(d=>{showToast('会话已刷新，模型 '+d.models+' 个','success')}).catch(()=>{}).finally(()=>{loadConfig();loadStats();setTimeout(()=>window.scrollTo(0,sy),100)})}
-async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();document.getElementById('force_disable_thinking').checked=cfg.force_disable_thinking||false;aliasData=cfg.model_alias||{};effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];const mr=await fetch('/v1/models');const md=await mr.json();modelList=(md.data||[]).map(m=>m.id).sort();renderAliasTable();renderEffortTable();renderSocks5Table();document.getElementById('activeSocks5').value=cfg.active_socks5||'';setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
-function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td>'+modelSelectHtml(aliasData[k])+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>').join('')}
-function modelSelectHtml(selected){let h='<select data-field="val" class="m-select">';h+='<option value="">-- 选择模型 --</option>';for(const m of modelList){h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}h+='</select>';return h}
-function addAliasRow(){const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td>'+modelSelectHtml('')+'</td><td><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr>')}
-function delAlias(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="3" class="empty-hint">暂无别名配置</td></tr>'}
-function collectAliases(){const r={};document.querySelectorAll('#aliasTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),v=tr.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});aliasData=r;return r}
+function apiTypeSelectHtml(selected){const v=selected||'openai';return '<select data-field="api_type" onchange="onUpstreamTypeChange(this)"><option value="openai"'+(v==='openai'?' selected':'')+'>OpenAI</option><option value="anthropic"'+(v==='anthropic'?' selected':'')+'>Anthropic</option><option value="openai-responses"'+(v==='openai-responses'?' selected':'')+'>Responses</option></select>'}
+function upstreamTypeLabel(value){if(value==='anthropic')return 'Anthropic';if(value==='openai-responses')return 'Responses';return 'OpenAI'}
+function nonEmptyLineCount(value){return String(value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean).length}
+function customModelCount(value){return String(value||'').split(',').map(s=>s.trim()).filter(Boolean).length}
+function responsesReasoningFormatHtml(value){const legacy=['reasoning_effort','legacy','legacy_reasoning_effort'].includes(value);return '<select data-field="responses_reasoning_format"><option value=""'+(!legacy?' selected':'')+'>标准 reasoning.effort</option><option value="legacy_reasoning_effort"'+(legacy?' selected':'')+'>兼容 reasoning_effort</option></select>'}
+function upstreamCardHtml(name,up,expanded){up=up||{};const apiType=up.api_type||'openai';const baseURL=up.base_url||'';const apiKey=up.api_key||'';const customModels=(up.custom_models||[]).join(',');const keyCount=nonEmptyLineCount(apiKey);const modelCount=(up.custom_models||[]).length;let h='<details class="upstream-item" data-original-name="'+esc(name||'')+'"'+(expanded?' open':'')+'>';h+='<summary><span class="upstream-summary-name">'+esc(name||'未命名上游')+'</span><span class="upstream-type-badge">'+upstreamTypeLabel(apiType)+'</span><span class="upstream-summary-url">'+esc(baseURL||'尚未配置 Base URL')+'</span><span class="upstream-summary-meta">'+keyCount+' Key · '+modelCount+' 模型</span></summary>';h+='<div class="upstream-body"><div class="upstream-form-grid">';h+='<div class="upstream-field"><label>名称</label><input value="'+esc(name||'')+'" data-field="name" placeholder="例如: main" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field"><label>接口类型</label>'+apiTypeSelectHtml(apiType)+'</div>';h+='<div class="upstream-field full"><label>Base URL</label><input value="'+esc(baseURL)+'" data-field="base_url" placeholder="https://example.com/v1" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"></div>';h+='<div class="upstream-field full"><label>API Key（每行一个）</label><textarea data-field="api_key" placeholder="每行填写一个 API Key" oninput="updateUpstreamCardSummary(this)">'+esc(apiKey)+'</textarea><div class="field-hint">支持填写多个 Key，请求时按顺序轮询。</div></div>';h+='<div class="upstream-field full"><label>自定义模型</label><div class="custom-models-row"><input value="'+esc(customModels)+'" data-field="custom_models" placeholder="model-a, model-b" oninput="updateUpstreamCardSummary(this)" onchange="syncUpstreamOptions()"><button type="button" class="btn btn-secondary" onclick="fetchUpstreamModels(this)">获取模型列表</button></div><div class="field-hint">多个模型使用英文逗号分隔；点"获取模型列表"从上游 /models 实时拉取并填入；填入后启动/刷新不再自动拉取。</div></div>';h+='<div class="upstream-field full responses-format-field"'+(apiType==='openai-responses'?'':' style="display:none"')+'><label>Responses 推理参数格式</label>'+responsesReasoningFormatHtml(up.responses_reasoning_format||'')+'</div>';h+='</div><div class="upstream-item-actions"><button class="btn btn-danger" onclick="delUpstream(this)">删除此上游</button></div></div></details>';return h}
+function buildModelListByUpstreamFromCustomModels(){const grouped={};Object.keys(upstreamData).forEach(name=>{const arr=(upstreamData[name]&&Array.isArray(upstreamData[name].custom_models))?upstreamData[name].custom_models:(typeof (upstreamData[name]||{}).custom_models==='string'?(upstreamData[name].custom_models.split(',').map(s=>s.trim()).filter(Boolean)):[]);grouped[name]=Array.from(new Set(arr)).sort()});return grouped}
+function normalizeAliasData(){const next={};Object.keys(aliasData||{}).forEach(k=>{const raw=aliasData[k];if(typeof raw==='object'&&raw){next[k]={target_model:raw.target_model||'',upstream:raw.upstream||'',socks5_proxy:raw.socks5_proxy||'',multimodal_model:raw.multimodal_model||'',multimodal_upstream:raw.multimodal_upstream||'',multimodal_socks5_proxy:raw.multimodal_socks5_proxy||''}}else{next[k]={target_model:typeof raw==='string'?raw:'',upstream:'',socks5_proxy:'',multimodal_model:'',multimodal_upstream:'',multimodal_socks5_proxy:''}}});aliasData=next}
+function normalizeUpstreamData(cfg){upstreamData=cfg.upstreams||{}}
+async function loadConfig(){const sy=window.scrollY;try{const r=await fetch('/api/config');const cfg=await r.json();aliasData=cfg.model_alias||{};normalizeAliasData();effortData=cfg.reasoning_effort_map||{};socks5Data=cfg.socks5_proxies||[];normalizeUpstreamData(cfg);modelListByUpstream=buildModelListByUpstreamFromCustomModels()
+renderUpstreamTable();renderAliasTable();renderEffortTable();renderSocks5Table();setTimeout(()=>window.scrollTo(0,sy),0)}catch(e){showToast('失败: '+e.message,'error')}}
+function renderUpstreamTable(){const list=document.getElementById('upstreamList');const names=Object.keys(upstreamData).sort();list.innerHTML=names.length?names.map(name=>upstreamCardHtml(name,upstreamData[name],false)).join(''):'<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';}
+function addUpstreamRow(){collectUpstreams();const list=document.getElementById('upstreamList');const empty=list.querySelector('.upstream-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',upstreamCardHtml('',{api_type:'openai'},true));const cards=list.querySelectorAll('.upstream-item');const input=cards.length?cards[cards.length-1].querySelector('[data-field="name"]'):null;if(input)input.focus()}
+function delUpstream(btn){collectAliases();const card=btn.closest('.upstream-item');if(card)card.remove();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();const list=document.getElementById('upstreamList');if(!list.querySelector('.upstream-item'))list.innerHTML='<div class="upstream-empty">暂无上游配置，请先添加一个上游。</div>';renderAliasTable()}
+function collectUpstreams(){const r={};document.querySelectorAll('#upstreamList .upstream-item').forEach(card=>{const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!name||!baseURL)return;const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value?.trim()||'';const reasoningFormat=(card.querySelector('[data-field="responses_reasoning_format"]')||{}).value||'';const up={base_url:baseURL,api_type:apiType};if(apiKey)up.api_key=apiKey;if(customRaw)up.custom_models=customRaw.split(',').map(s=>s.trim()).filter(Boolean);if(apiType==='openai-responses'&&reasoningFormat)up.responses_reasoning_format=reasoningFormat;r[name]=up;card.dataset.originalName=name});upstreamData=r;return r}
+function updateUpstreamCardSummary(el){const card=el.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const customRaw=(card.querySelector('[data-field="custom_models"]')||{}).value||'';card.querySelector('.upstream-summary-name').textContent=name||'未命名上游';card.querySelector('.upstream-summary-url').textContent=baseURL||'尚未配置 Base URL';card.querySelector('.upstream-type-badge').textContent=upstreamTypeLabel(apiType);card.querySelector('.upstream-summary-meta').textContent=nonEmptyLineCount(apiKey)+' Key · '+customModelCount(customRaw)+' 模型'}
+function onUpstreamTypeChange(sel){const card=sel.closest('.upstream-item');const field=card?card.querySelector('.responses-format-field'):null;if(field)field.style.display=sel.value==='openai-responses'?'':'none';updateUpstreamCardSummary(sel)}
+function syncUpstreamOptions(){collectAliases();collectUpstreams();modelListByUpstream=buildModelListByUpstreamFromCustomModels();renderAliasTable()}function fetchUpstreamModels(btn){const card=btn.closest('.upstream-item');if(!card)return;const name=(card.querySelector('[data-field="name"]')||{}).value?.trim()||'';const baseURL=(card.querySelector('[data-field="base_url"]')||{}).value?.trim()||'';if(!baseURL){alert('请先填写 Base URL');return}const apiKey=(card.querySelector('[data-field="api_key"]')||{}).value||'';const apiType=(card.querySelector('[data-field="api_type"]')||{}).value||'openai';const input=card.querySelector('[data-field="custom_models"]');const body={base_url:baseURL,api_type:apiType};if(apiKey)body.api_key=apiKey;const orig=btn.textContent;btn.disabled=true;btn.textContent='获取中…';fetch('/api/upstream/models?name='+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>{if(!r.ok){return r.text().then(t=>{throw new Error(t||('HTTP '+r.status))})}return r.json()}).then(d=>{const arr=Array.isArray(d.models)?d.models:[];if(arr.length===0){alert('上游未返回任何模型');return}input.value=arr.join(', ');updateUpstreamCardSummary(input);syncUpstreamOptions();btn.textContent='已填充 '+arr.length+' 个'}).catch(e=>{alert('获取失败: '+(e&&e.message?e.message:e))}).finally(()=>{btn.disabled=false;btn.textContent=orig})}
+
+function modelsForUpstream(name){const resolved=(name||'').trim();return modelListByUpstream[resolved]||[]}
+function upstreamSelectHtml(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="upstream" class="m-select" disabled><option value="">（未配置上游）</option></select>';let h='<select data-field="upstream" class="m-select" onchange="onAliasUpstreamChange(this)"><option value="">-- 选择上游 --</option>';for(const name of names){h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
+function modelSelectHtml(selected,upstreamName){if(!upstreamName)return '<select data-field="val" class="m-select" disabled><option value="">-- 选择模型 --</option></select>';const models=modelsForUpstream(upstreamName);if(models.length===0)return '<select data-field="val" class="m-select" disabled><option value="">（未配置模型）</option></select>';let h='<select data-field="val" class="m-select"><option value="">-- 选择模型 --</option>';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
+function socks5SelectHtml(selected){let h='<select data-field="socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
+// 多模态模型的下拉：data-field 用 mm_val，模型从 data-mm-upstream 所选上游拉取
+function mmSelectHtml(selected,upstreamName){if(!upstreamName)return '<select data-field="mm_val" class="m-select" disabled><option value="">-- 选择模型 --</option></select>';const models=modelsForUpstream(upstreamName);let h='<select data-field="mm_val" class="m-select"><option value="">-- 选择模型 --</option>';let found=!selected;for(const m of models){if(selected===m)found=true;h+='<option value="'+esc(m)+'"'+(selected===m?' selected':'')+'>'+esc(m)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (自定义)</option>';h+='</select>';return h}
+// 多模态上游下拉（data-field=mm_upstream），切换时刷新同行的 mm_val 模型列表
+function upstreamSelectHtmlMm(selected){const names=Object.keys(upstreamData).sort();if(names.length===0)return '<select data-field="mm_upstream" class="m-select" disabled><option value="">-- 选择上游 --</option></select>';let h='<select data-field="mm_upstream" class="m-select" onchange="onMmUpstreamChange(this)"><option value="">-- 选择上游 --</option>';let found=!selected;for(const name of names){if(selected===name)found=true;h+='<option value="'+esc(name)+'"'+(selected===name?' selected':'')+'>'+esc(name)+'</option>'}h+='</select>';return h}
+// 多模态独立代理下拉
+function socks5SelectHtmlMm(selected){let h='<select data-field="mm_socks5_proxy" class="m-select"><option value="">直连</option>';let found=!selected;for(const p of socks5Data){if(!p||!p.addr)continue;const addr=String(p.addr).trim();if(!addr)continue;if(selected===addr)found=true;const label=p.name?String(p.name)+' ('+addr+')':addr;h+='<option value="'+esc(addr)+'"'+(selected===addr?' selected':'')+'>'+esc(label)+'</option>'}if(selected&&!found)h+='<option value="'+esc(selected)+'" selected>'+esc(selected)+' (已失效)</option>';h+='</select>';return h}
+// 多模态上游变化时刷新多模态模型列表
+function onMmUpstreamChange(sel){const row=sel.closest('tr');const curVal=(row.querySelector('[data-field="mm_val"]')||{}).value?.trim()||'';const mmSel=row.querySelector('[data-field="mm_val"]');if(mmSel){const mmUp=sel.value;const newSel=document.createElement('span');newSel.innerHTML=mmSelectHtml(curVal,mmUp);const replaced=mmSel.closest('span');if(replaced){replaced.replaceWith(newSel.firstChild)}else{mmSel.outerHTML=newSel.innerHTML}}}
+function renderAliasTable(){const tb=document.querySelector('#aliasTable tbody');const ks=Object.keys(aliasData);if(!ks.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>';return}const sortedUpstreams=Object.keys(upstreamData).sort();const aliasUp=sortedUpstreams[0]||'';tb.innerHTML=ks.map(k=>{const entry=aliasData[k]||{target_model:'',upstream:'',socks5_proxy:'',multimodal_model:'',multimodal_upstream:'',multimodal_socks5_proxy:''};const upName=entry.upstream||aliasUp;const mmUpName=entry.multimodal_upstream||upName;const mmUpSel=entry.multimodal_upstream||'';return '<tr><td rowspan="2"><input value="'+esc(k)+'" data-field="key"></td><td data-model-cell="1"><span style="font-size:10px;color:var(--text-ter)">主上游</span><br>'+upstreamSelectHtml(upName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主模型</span><br>'+modelSelectHtml(entry.target_model||'',upName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主代理出口</span><br>'+socks5SelectHtml(entry.socks5_proxy||'')+'</td><td rowspan="2"><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr><tr><td data-mm-cell="1"><span style="font-size:10px;color:var(--text-ter)">多模态上游</span><br>'+upstreamSelectHtmlMm(mmUpSel)+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态模型</span><br>'+mmSelectHtml(entry.multimodal_model||'',mmUpName)+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态代理</span><br>'+socks5SelectHtmlMm(entry.multimodal_socks5_proxy||'')+'</td></tr>'}).join('')}
+function onAliasUpstreamChange(sel){const row=sel.closest('tr');const curVal=(row.querySelector('[data-field="val"]')||{}).value?.trim()||'';const vSel=row.querySelector('[data-field="val"]');if(vSel){const newSel=document.createElement('span');newSel.innerHTML=modelSelectHtml(curVal,sel.value);const replaced=vSel.closest('span');if(replaced){replaced.replaceWith(newSel.firstChild)}else{vSel.outerHTML=newSel.innerHTML}}}
+function addAliasRow(){collectUpstreams();collectSocks5();const tb=document.querySelector('#aliasTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';const sortedUpstreams=Object.keys(upstreamData).sort();const defaultUp=(sortedUpstreams.length&&sortedUpstreams[0])||'';tb.insertAdjacentHTML('beforeend','<tr><td rowspan="2"><input value="" placeholder="例如: gpt-5.5" data-field="key"></td><td data-model-cell="1"><span style="font-size:10px;color:var(--text-ter)">主上游</span><br>'+upstreamSelectHtml(defaultUp)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主模型</span><br>'+modelSelectHtml('', defaultUp)+'</td><td><span style="font-size:10px;color:var(--text-ter)">主代理出口</span><br>'+socks5SelectHtml('')+'</td><td rowspan="2"><button class="btn btn-danger" onclick="delAlias(this)">删除</button></td></tr><tr><td data-mm-cell="1"><span style="font-size:10px;color:var(--text-ter)">多模态上游</span><br>'+upstreamSelectHtmlMm('')+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态模型</span><br>'+mmSelectHtml('','')+'</td><td><span style="font-size:10px;color:var(--text-ter)">多模态代理</span><br>'+socks5SelectHtmlMm('')+'</td></tr>')}
+function delAlias(btn){const row=btn.closest('tr');const mmRow=row.nextElementSibling;const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&aliasData[ki.value])delete aliasData[ki.value];row.remove();if(mmRow&&mmRow.querySelector('[data-field="mm_val"]'))mmRow.remove();if(!Object.keys(aliasData).length)document.querySelector('#aliasTable tbody').innerHTML='<tr><td colspan="5" class="empty-hint">暂无别名配置</td></tr>'}
+function collectAliases(){const r={};const rows=document.querySelectorAll('#aliasTable tbody tr');for(let i=0;i<rows.length;i++){const tr=rows[i];const k=tr.querySelector('[data-field="key"]');if(!k||!k.value.trim())continue;const u=tr.querySelector('[data-field="upstream"]'),v=tr.querySelector('[data-field="val"]'),p=tr.querySelector('[data-field="socks5_proxy"]');const mmRow=rows[i+1];const mm=mmRow?mmRow.querySelector('[data-field="mm_val"]'):null,mmup=mmRow?mmRow.querySelector('[data-field="mm_upstream"]'):null,mmsk=mmRow?mmRow.querySelector('[data-field="mm_socks5_proxy"]'):null;if(!mmRow)continue;const aliasKey=k.value.trim();const targetModel=v?v.value.trim():'';const upstreamName=u?u.value.trim():'';const socks5Proxy=p?p.value.trim():'';const multimodalModel=mm?mm.value.trim():'';let mmUpstream=mmup?mmup.value.trim():'';const mmProxy=mmsk?mmsk.value.trim():'';if(targetModel||upstreamName||socks5Proxy||multimodalModel||mmUpstream||mmProxy)r[aliasKey]={target_model:targetModel,upstream:upstreamName,socks5_proxy:socks5Proxy,multimodal_model:multimodalModel,multimodal_upstream:mmUpstream,multimodal_socks5_proxy:mmProxy};i++}aliasData=r;return r}
 
 
 
 
 
 
-function renderEffortTable(){const tb=document.querySelector('#effortTable tbody');const ks=Object.keys(effortData);if(!ks.length){tb.innerHTML='<tr><td colspan="3" class="empty-hint">暂无映射配置</td></tr>';return}tb.innerHTML=ks.map(k=>'<tr><td><input value="'+esc(k)+'" data-field="key"></td><td><input value="'+esc(effortData[k])+'" data-field="val"></td><td><button class="btn btn-danger" onclick="delEffort(this)">删除</button></td></tr>').join('')}
-function addEffortRow(){const tb=document.querySelector('#effortTable tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';tb.insertAdjacentHTML('beforeend','<tr><td><input value="" placeholder="例如: low" data-field="key"></td><td><input value="" placeholder="例如: high" data-field="val"></td><td><button class="btn btn-danger" onclick="delEffort(this)">删除</button></td></tr>')}
-function delEffort(btn){const row=btn.closest('tr');const ki=row.querySelector('[data-field="key"]');if(ki&&ki.value&&effortData[ki.value])delete effortData[ki.value];row.remove();if(!Object.keys(effortData).length)document.querySelector('#effortTable tbody').innerHTML='<tr><td colspan="3" class="empty-hint">暂无映射配置</td></tr>'}
-function collectEfforts(){const r={};document.querySelectorAll('#effortTable tbody tr').forEach(tr=>{const k=tr.querySelector('[data-field="key"]'),v=tr.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;return r}
-function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('');renderSocks5Select()}
-function addSocks5Row(){const tb=document.querySelector('#socks5Table tbody');if(tb.querySelector('.empty-hint'))tb.innerHTML='';socks5Data.push({addr:'',name:''});renderSocks5Table()}
-function delSocks5(i){socks5Data.splice(i,1);renderSocks5Table()}
+function effortRowHtml(key,val){return '<div class="effort-row"><input value="'+esc(key||'')+'" data-field="key" placeholder="例如: low"><span class="effort-arrow">→</span><input value="'+esc(val||'')+'" data-field="val" placeholder="例如: high"><button class="btn btn-danger" onclick="delEffort(this)">删除</button></div>'}
+function updateEffortSummary(){const el=document.getElementById('effortSummary');if(!el)return;const count=Object.keys(effortData||{}).length;el.textContent=count?count+' 条映射':'未配置 · 原值透传'}
+function renderEffortTable(){const list=document.getElementById('effortList');const ks=Object.keys(effortData);list.innerHTML=ks.length?ks.map(k=>effortRowHtml(k,effortData[k])).join(''):'<div class="effort-empty">未配置，reasoning_effort 将按原值透传</div>';updateEffortSummary()}
+function addEffortRow(){collectEfforts();const details=document.getElementById('reasoningEffortDetails');details.open=true;const list=document.getElementById('effortList');const empty=list.querySelector('.effort-empty');if(empty)empty.remove();list.insertAdjacentHTML('beforeend',effortRowHtml('',''));const rows=list.querySelectorAll('.effort-row');const input=rows.length?rows[rows.length-1].querySelector('[data-field="key"]'):null;if(input)input.focus()}
+function delEffort(btn){const row=btn.closest('.effort-row');if(row)row.remove();collectEfforts();renderEffortTable()}
+function collectEfforts(){const r={};document.querySelectorAll('#effortList .effort-row').forEach(row=>{const k=row.querySelector('[data-field="key"]'),v=row.querySelector('[data-field="val"]');if(k&&k.value.trim())r[k.value.trim()]=v?v.value.trim():''});effortData=r;updateEffortSummary();return r}
+function renderSocks5Table(){const tb=document.querySelector('#socks5Table tbody');if(!socks5Data.length){tb.innerHTML='<tr><td colspan="5" class="empty-hint">暂无代理配置</td></tr>';return}tb.innerHTML=socks5Data.map((p,i)=>'<tr><td><input value="'+esc(p.name||'')+'" data-field="name" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.addr)+'" data-field="addr" placeholder="例如: 127.0.0.1:1080" onchange="syncSocks5AliasOptions()"></td><td><input value="'+esc(p.username||'')+'" data-field="username"></td><td><input value="'+esc(p.password||'')+'" data-field="password" type="password"></td><td><button class="btn btn-danger" onclick="delSocks5('+i+')">删除</button></td></tr>').join('')}
+function addSocks5Row(){collectSocks5();socks5Data.push({addr:'',name:''});renderSocks5Table()}
+function delSocks5(i){collectAliases();const rows=document.querySelectorAll('#socks5Table tbody tr');if(rows[i])rows[i].remove();collectSocks5();renderSocks5Table();renderAliasTable()}
 function collectSocks5(){const r=[];document.querySelectorAll('#socks5Table tbody tr').forEach(tr=>{const a=tr.querySelector('[data-field="addr"]');if(a&&a.value.trim())r.push({addr:a.value.trim(),name:(tr.querySelector('[data-field="name"]')||{}).value?.trim()||'',username:(tr.querySelector('[data-field="username"]')||{}).value?.trim()||'',password:(tr.querySelector('[data-field="password"]')||{}).value?.trim()||''})});socks5Data=r;return r}
-function renderSocks5Select(){const sel=document.getElementById('activeSocks5');const cur=sel.value;sel.innerHTML='<option value="">直连（不使用代理）</option>';socks5Data.forEach(p=>{if(p.addr){const label=p.name?p.name+' ('+p.addr+')':p.addr;const opt=document.createElement('option');opt.value=p.addr;opt.textContent=label;sel.appendChild(opt)}});if(socks5Data.length>=1){const opt=document.createElement('option');opt.value='__rate_limit_switch__';opt.textContent='限流切换（429 后切换，含直连）';sel.appendChild(opt);const opt2=document.createElement('option');opt2.value='__rate_limit_switch_no_direct__';opt2.textContent='限流切换（429 后切换，不含直连）';sel.appendChild(opt2)}if(socks5Data.length>=2){const opt=document.createElement('option');opt.value='__round_robin__';opt.textContent='轮询（每次请求切换）';sel.appendChild(opt)}sel.value=cur;if(!sel.value)sel.value='';}
-async function saveConfig(){collectAliases();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,force_disable_thinking:document.getElementById('force_disable_thinking').checked,socks5_proxies:socks5Data,active_socks5:document.getElementById('activeSocks5').value};try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast('配置已保存','success');loadConfig()}catch(e){showToast('保存失败: '+e.message,'error')}}
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function syncSocks5AliasOptions(){collectAliases();collectSocks5();renderAliasTable()}
+async function saveConfig(section){const aliasRows=[...document.querySelectorAll('#aliasTable tbody tr')];if(aliasRows.some(tr=>{const k=tr.querySelector('[data-field="key"]');return k&&!k.value.trim()})){showToast('存在别名（请求名）为空的行，请填写后再保存','error');return}const dupCheck={};for(const tr of aliasRows){const k=tr.querySelector('[data-field="key"]');const key=k?k.value.trim():'';if(key){if(dupCheck[key]){showToast('存在重复的别名「'+key+'」，请修改后再保存','error');return}dupCheck[key]=true}}collectAliases();collectUpstreams();collectEfforts();collectSocks5();const cfg={model_alias:aliasData,reasoning_effort_map:effortData,socks5_proxies:socks5Data,upstreams:upstreamData};const label=section||'配置';try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});if(!r.ok)throw new Error(await r.text());showToast(label+'已保存','success');loadConfig()}catch(e){showToast(label+'保存失败: '+e.message,'error')}}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function showToast(msg,t){const e=document.getElementById('toast');e.textContent=msg;e.className=t+' show';clearTimeout(e._tid);e._tid=setTimeout(()=>e.classList.remove('show'),2500)}
 async function resetStats(){if(!confirm('确认清空所有 Token 统计？\n此操作不可撤销。'))return;const s=document.getElementById('resetStatus');s.textContent='清空中...';try{const r=await fetch('/api/stats',{method:'DELETE'});if(!r.ok)throw new Error(await r.text());document.getElementById('statsContent').innerHTML='<div class="empty-hint">暂无数据</div>';s.textContent='已清空';setTimeout(()=>s.textContent='',2000)}catch(e){s.textContent='失败: '+e.message}}
 async function loadStats(){try{const r=await fetch('/api/stats');const d=await r.json();const ms=d.models||{};const ks=Object.keys(ms);const dm=d.daily?d.daily.models||{}:{};const dk=Object.keys(dm);let h='';if(d.daily&&d.daily.date){h+='<div style="margin-bottom:16px;padding:10px 14px;background:var(--accent);color:#fff;border-radius:8px;font-size:13px">📊 今日统计 ('+esc(d.daily.date)+')：请求 '+fmt(d.daily.total_requests)+' 次</div>'}if(dk.length>0){h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">今日模型用量</h3><table class="tbl" id="dailyTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';let dr=0,dp=0,dc=0,dt=0;for(const k of dk){const m=dm[k];if(!m)continue;h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';dr+=m.request_count;dp+=m.prompt_tokens;dc+=m.completion_tokens;dt+=m.total_tokens}h+='<tr style="font-weight:600"><td>今日合计</td><td>'+fmt(dr)+'</td><td>'+fmt(dp)+'</td><td>'+fmt(dc)+'</td><td>'+fmt(dt)+'</td></tr>';h+='</tbody></table><hr style="border:none;border-top:1px solid var(--border);margin:20px 0">'}h+='<h3 style="font-size:14px;font-weight:600;margin:0 0 8px">累计统计</h3><table class="tbl" id="statsTable"><thead><tr><th>模型</th><th>请求数</th><th>输入 Token</th><th>输出 Token</th><th>总计 Token</th></tr></thead><tbody>';if(!ks.length){h+='<tr><td colspan="5" class="empty-hint">暂无数据</td></tr>'}else{let tr=0,pt=0,ct=0,tt=0;for(const k of ks){const m=ms[k];h+='<tr><td>'+esc(k)+'</td><td>'+fmt(m.request_count)+'</td><td>'+fmt(m.prompt_tokens)+'</td><td>'+fmt(m.completion_tokens)+'</td><td>'+fmt(m.total_tokens)+'</td></tr>';tr+=m.request_count;pt+=m.prompt_tokens;ct+=m.completion_tokens;tt+=m.total_tokens}h+='<tr style="font-weight:600"><td>累计总计</td><td>'+fmt(tr)+'</td><td>'+fmt(pt)+'</td><td>'+fmt(ct)+'</td><td>'+fmt(tt)+'</td></tr>'}h+='</tbody></table>';document.getElementById('statsContent').innerHTML=h}catch(e){document.getElementById('statsContent').innerHTML='<div class="empty-hint">加载失败</div>'}}
@@ -4322,7 +7407,7 @@ function fmt(n){return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}window.
 func main() {
 	flag.StringVar(&port, "port", "8000", "服务端口")
 	flag.StringVar(&configPath, "config", "config.json", "配置文件路径")
-	flag.StringVar(&adminPassword, "password", "123456", "管理面板密码（留空则不启用登录验证）")
+	flag.StringVar(&adminPassword, "password", "", "管理面板密码（留空则不启用登录验证）")
 	flag.BoolVar(&debugMode, "debug", false, "启用调试日志")
 	flag.Parse()
 
@@ -4334,25 +7419,11 @@ func main() {
 
 	loadTokenStats()
 	log.Printf("配置已从 %s 加载", configPath)
-	initOCSession()
-	models, err := fetchModels()
-	if err != nil {
-		log.Printf("警告: 无法获取模型列表: %v", err)
-	} else {
-		modelMu.Lock()
-		modelsCache = models
-		modelsLoaded = true
-		modelMu.Unlock()
-		log.Printf("已加载 %d 个模型:", len(models))
-		for _, m := range models {
-			log.Printf("  - %s", m.ID)
-		}
-	}
-	log.Printf("OPENCODE TO API 代理服务器")
+	log.Printf("LLM Gateway")
 	log.Printf("===================")
 	log.Printf("端口:     %s", port)
-	log.Printf("上游:     https://opencode.ai/zen/v1/chat/completions (API)")
-	log.Printf("模型：  %d 个模型已加载", len(getModelIDs()))
+	log.Printf("上游:     %d 个", getConfiguredUpstreamCount())
+	log.Printf("模型：  %d 个自定义模型", countConfiguredModels())
 	log.Printf("别名：  %d", len(modelAlias))
 
 	if adminPassword != "" {
@@ -4363,13 +7434,14 @@ func main() {
 	log.Printf("===================")
 	http.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
 	http.HandleFunc("/v1/responses", responsesHandler)
-	http.HandleFunc("/v1/messages", claudeMessagesHandler)
+	http.HandleFunc("/v1/messages", anthropicMessagesHandler)
 	http.HandleFunc("/v1/models", listModelsHandler)
 	http.HandleFunc("/login", loginHandler)
 	http.HandleFunc("/logout", logoutHandler)
 	http.HandleFunc("/api/config", requireAuth(adminConfigHandler))
 	http.HandleFunc("/api/stats", requireAuth(adminStatsHandler))
 	http.HandleFunc("/api/reload", requireAuth(reloadHandler))
+	http.HandleFunc("/api/upstream/models", requireAuth(upstreamModelsHandler))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
