@@ -20,7 +20,7 @@ jobs:
     # 关键：设置交叉编译的环境变量，目标是 Windows 7 64位
     - name: Build for Windows 7 64-bit
       run: |
-        GOOS=windows GOARCH=amd64 go build -v -o myapp.exe ./...
+        GOOS=windows GOARCH=amd64 go build -v -o myapp.exe .
     
     # 可选：测试（测试通常在编译前运行，这里保持原有功能）
     - name: Test
